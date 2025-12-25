@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()  # Load .env file before any other imports that use env vars
+
 import faulthandler, sys, signal
 faulthandler.enable(all_threads=True)
 for signame in ("SIGTERM","SIGINT","SIGBREAK"):
