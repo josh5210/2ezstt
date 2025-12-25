@@ -65,7 +65,45 @@ Send audio to `ws://127.0.0.1:8767/ws` and receive `partial` and `final` transcr
 
 ---
 
+## Discord Bot Setup
+
+### Create a Bot Application
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
+2. Click **New Application** → Name it → **Create**
+3. Go to **Bot** → Click **Add Bot**
+4. Copy the **Token** → paste into `.env` as `DISCORD_TOKEN`
+
+### Required Bot Permissions
+Go to **OAuth2 → URL Generator** and select:
+
+**Scopes:**
+- ✅ `bot`
+
+**Bot Permissions:**
+- ✅ `Connect` — Join voice channels
+- ✅ `Speak` — Play TTS audio (optional)
+- ✅ `View Channels` — See channels
+- ✅ `Send Messages` — Post transcripts
+- ✅ `Read Message History` — Edit partial messages
+
+### Invite to Server
+1. Copy the generated OAuth2 URL
+2. Open in browser → Select your server → Authorize
+
+### Get Channel IDs
+1. Enable **Developer Mode** in Discord (User Settings → Advanced)
+2. Right-click channels → **Copy ID**
+3. Add to `.env`:
+   ```env
+   GUILD_ID=your-server-id
+   VOICE_CHANNEL_ID=voice-channel-to-listen
+   TRANSCRIPT_CHANNEL_ID=text-channel-for-transcripts
+   ```
+
+---
+
 ## Architecture
+
 
 ## System Overview
 
