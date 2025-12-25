@@ -1,0 +1,176 @@
+# Agent Prompt — Implement Partials Engine (Phase 5)
+
+## Context
+
+`ezstt` has:
+
+* **Endpointing** (Phase 2) that detects `IN_SPEECH` segments and yields finalized utterances.
+* **WhisperBackend** (Phase 3) for one‑shot decode of an utterance.
+* **Keyword spotter** (Phase 4) used for very short commands.
+
+Phase 5 adds **partials**: while a speaker is actively talking (before endpointing fires), we emit periodic interim transcripts derived from the **most recent slice** of the open utterance. On endpoint, we emit a single **final** transcript for the whole utterance and stop partials.
+
+Design goals:
+
+* Low complexity; zero queues.
+* At most **one partial decode** running at a time (coalesce when busy).
+* Partials **replace** previous partials for the same utterance (revision model) to avoid Discord spam.
+
+## What to build
+
+Create `sidecar/partials.py` and tests. Integrate lightly with `server.py` (emit events via callback).
+
+### Configuration (read via small config helper or os.getenv with defaults)
+
+```
+EZSTT_PARTIALS_ENABLE=1
+EZSTT_PARTIAL_INTERVAL_MS=300    # cadence for attempts
+EZSTT_PARTIAL_WINDOW_MS=800      # how much recent audio to decode
+EZSTT_PARTIAL_MIN_MS=220         # don't emit before we have this much voiced since start
+EZSTT_PARTIAL_MAX_CHARS=160      # truncate to keep UI readable
+EZSTT_PARTIAL_REQUIRE_CHANGE=1   # only emit when text changed since last emit
+EZSTT_SR=16000
+```
+
+### Event model (server → client)
+
+Represent partials as a structured event (class or Pydantic in `events.py`):
+
+```python
+@dataclass
+class PartialEvent:
+    session_id: str
+    speaker_id: str
+    utterance_id: str
+    revision: int            # increments per partial for this utterance
+    text: str
+    t0_ms: int               # slice start (absolute session time)
+    t1_ms: int               # slice end   (absolute session time)
+    confidence: float        # heuristic from WhisperBackend
+    latency_ms: int          # decode wall time
+    source: str = "whisper"
+```
+
+* **Final events** already exist in your schema; ensure both share `utterance_id` so the client can update/replace the partial message.
+
+### Public API (partials engine)
+
+```python
+from dataclasses import dataclass
+from typing import Callable, Optional
+import numpy as np
+
+@dataclass
+class PartialsConfig:
+    sr: int = 16000
+    interval_ms: int = 300
+    window_ms: int = 800
+    min_ms: int = 220
+    max_chars: int = 160
+    require_change: bool = True
+
+class PartialsEngine:
+    def __init__(self,
+                 cfg: PartialsConfig,
+                 whisper_backend,
+                 emit_partial: Callable[["PartialEvent"], None]):
+        """`whisper_backend` must expose `transcribe(audio_pcm16, sr, time_offset_ms, ...)`.
+        `emit_partial` is called synchronously when a new partial is ready.
+        """
+
+    def on_utterance_start(self, utterance_id: str, start_ms: int) -> None:
+        """Reset state for a new open utterance.
+        `utterance_id` is a unique id assigned by server.
+        `start_ms` is absolute session time of utterance start.
+        """
+
+    def on_frame(self, frame_pcm16: np.ndarray, now_ms: int) -> None:
+        """Feed 20 ms frames while IN_SPEECH.
+        Internally buffers audio and schedules partial decode attempts according to `interval_ms`.
+        If a previous decode is still in progress, coalesce (skip this tick)."""
+
+    def on_utterance_end(self) -> None:
+        """Stop any scheduled partial attempt and clear state. The server will run
+        a final full-utterance decode separately. """
+```
+
+**Notes**
+
+* Keep `PartialsEngine` **single‑threaded** and **synchronous** for simplicity. It should *not* spawn background tasks; instead, it should decide *when* to decode and call `whisper_backend.transcribe()` **inline**. We rely on short windows (≤800 ms) and greedy decode for speed.
+* The server’s audio loop calls `on_frame` once per 20 ms; inside, decide whether it’s time to attempt a partial (time since last attempt ≥ interval and voiced\_since\_start ≥ min\_ms). If yes and not already decoding, slice the **last `window_ms`** from the internal buffer and call the backend immediately.
+* If decoding a partial takes longer than `interval_ms`, subsequent ticks will skip until the previous call returns (coalescing ensures at most one inflight decode). This keeps control flow trivial and testable.
+
+### Buffering and slicing
+
+* Maintain an internal rolling buffer of int16 samples for the **current utterance only**.
+* On `on_frame`, append the frame samples; also track `voiced_since_start_ms = now_ms - utterance_start_ms`.
+* When attempting a partial, compute:
+
+  * `slice_end_ms = now_ms` (or `now_ms - 20` if you prefer to exclude the current frame)
+  * `slice_start_ms = max(utterance_start_ms, slice_end_ms - window_ms)`
+* Extract those samples. Provide **left context** = everything before the slice in the current utterance (up to `pad_short_ms` from WhisperBackend) so very short early partials don’t come out empty.
+* Call `WhisperBackend.transcribe(audio_slice, sr, time_offset_ms=slice_start_ms, context_left_pcm16=left_context, context_right_pcm16=None)`.
+
+### Emission rules
+
+* Ignore empty/whitespace text.
+* If `require_change` and `text == last_partial_text`: don’t emit.
+* Truncate to `max_chars`.
+* Increment `revision`; emit `PartialEvent` with `t0_ms = slice_start_ms`, `t1_ms = slice_end_ms`.
+
+### Integration touch in `server.py`
+
+* When the endpointer transitions to `IN_SPEECH`, call `partials.on_utterance_start(utterance_id, start_ms)`.
+* For each incoming frame while in speech: `partials.on_frame(frame, now_ms)`.
+* When endpointing finalizes, call `partials.on_utterance_end()` **before** you run the final full decode.
+
+## Unit tests — `tests/test_partials.py`
+
+Use `pytest` (and optionally `pytest-asyncio` not needed since we kept sync). Mock `WhisperBackend.transcribe` to return deterministic texts and timings.
+
+1. **test\_no\_partial\_before\_min\_ms**
+
+   * Feed 200 ms voiced; expect 0 partials (min\_ms=220).
+
+2. **test\_cadence\_basic**
+
+   * interval=300, window=800. Feed 2 seconds of frames. Mock backend to return `"hel"`, then `"hello"`, then `"hello there"` each time it’s called. Assert 3 partials emitted at roughly 300 ms cadence after min\_ms is reached, with increasing `revision` and non‑decreasing times.
+
+3. **test\_coalesce\_when\_busy**
+
+   * Make backend sleep (simulate decode) for longer than interval. Ensure we never have overlapping calls (coalesced) and the number of partials matches completed calls.
+
+4. **test\_require\_change\_filters\_duplicates**
+
+   * With `require_change=True`, if backend returns same text twice, only the first emits.
+
+5. **test\_window\_slice\_alignment**
+
+   * Verify that the backend was called with audio whose duration is ≤ window and `time_offset_ms` equals `slice_start_ms`.
+
+6. **test\_on\_utterance\_end\_stops\_partials**
+
+   * After calling `on_utterance_end()`, further `on_frame` calls must not trigger partials until a new `on_utterance_start()`.
+
+7. **test\_truncation\_max\_chars**
+
+   * Long partial text gets truncated to `max_chars`.
+
+## Implementation tips
+
+* 20 ms frames at 16 kHz = 320 samples; store frames in a Python list and `np.concatenate` only when slicing for decode to keep per‑frame overhead low.
+* For timing in tests, simulate `now_ms` by incrementing a counter by 20 per frame.
+* Make `emit_partial` a simple append to an in‑memory list in tests so assertions are easy.
+
+## Done criteria
+
+* All unit tests pass quickly (
+* Partials show up with the expected cadence and stop on finalize.
+* No overlapping partial decodes; stable ordering via `revision`.
+* The code path has **zero background tasks** and is easy to reason about.
+
+## Out of scope
+
+* Whisper **final** decoding (handled elsewhere)
+* KWS (already implemented)
+* WebSocket serialization (server will wrap `PartialEvent` into WS messages)

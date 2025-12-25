@@ -1,0 +1,28 @@
+# Environment
+.env
+*.log
+
+# Python
+venv*
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.pytest*
+
+# Node
+node_modules
+dist
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Audio files (test recordings)
+*.wav
+
+# OS
+.DS_Store
+Thumbs.db

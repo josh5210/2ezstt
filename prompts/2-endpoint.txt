@@ -1,0 +1,241 @@
+# Agent Prompt — Implement `endpoint.py` (ezstt Phase 2)
+
+## Context
+
+We are rebooting our speech-to-text stack as **ezstt** with a simple, reliable architecture. Phase 2 focuses on **endpointing**: turning a stream of 16 kHz PCM audio frames into well-formed utterance segments using WebRTC VAD. This replaces the old micro-batch/queue approach. Your module must be deterministic, low-latency, and easy to test.
+
+## Objective
+
+Implement `sidecar/endpoint.py` that:
+
+* Consumes **20 ms** mono PCM16 **16 kHz** frames.
+* Runs **WebRTC VAD** with configurable aggressiveness.
+* Emits **utterance segments** with start/end timestamps and audio payload, using:
+
+  * **Start trigger:** ≥ `MIN_SPEECH_MS` of contiguous voiced frames.
+  * **End trigger:** ≥ `END_SILENCE_MS` of contiguous unvoiced frames.
+  * **Pre-roll:** prepend up to `PREROLL_MS` of audio that occurred immediately before start.
+* Integrates cleanly with a ring buffer for pre-roll and a simple state machine.
+
+## Deliverables
+
+* `sidecar/endpoint.py` (primary)
+* Unit tests under `tests/test_endpoint.py`
+* Small docstring at top describing state machine and configs
+
+## Constraints & Defaults
+
+Use these default environment-configured values (we’ll wire config later, but hard-coded defaults in this module are fine for now):
+
+```
+SAMPLE_RATE = 16000        # Hz
+FRAME_MS = 20              # ms, MUST be 10/20/30 for WebRTC VAD; we use 20
+MIN_SPEECH_MS = 120        # ms of voiced audio to start an utterance
+END_SILENCE_MS = 250       # ms of silence to end an utterance
+PREROLL_MS = 120           # ms of audio kept before detected start
+VAD_AGGRESSIVENESS = 2     # 0..3; higher = more aggressive (fewer false positives)
+```
+
+**NOTE:** 20 ms frames at 16 kHz = **320 samples** per frame, 16‑bit little-endian PCM (int16).
+
+## Public API (what `server.py` will use)
+
+Implement the following in `endpoint.py`:
+
+```python
+from dataclasses import dataclass
+from typing import Optional, List, Iterable
+import numpy as np
+
+@dataclass
+class EndpointConfig:
+    sample_rate: int = 16000
+    frame_ms: int = 20
+    min_speech_ms: int = 120
+    end_silence_ms: int = 250
+    preroll_ms: int = 120
+    vad_aggressiveness: int = 2  # 0..3
+
+@dataclass
+class Utterance:
+    # Absolute times in milliseconds since session start
+    t0_ms: int
+    t1_ms: int
+    # PCM16 mono, int16 numpy array (no trailing silence beyond t1_ms)
+    audio: np.ndarray  # dtype=np.int16, shape=(n_samples,)
+    # Diagnostics
+    voiced_ms: int
+    silence_tail_ms: int
+    frames: int
+
+class Endpoint:
+    def __init__(self, cfg: EndpointConfig): ...
+
+    def reset(self) -> None:
+        """Reset internal state to IDLE (no active utterance)."""
+
+    def feed_frame(self, frame_pcm16: np.ndarray) -> Optional[Utterance]:
+        """
+        Ingest a single 20 ms frame (PCM16, mono, shape=(320,), dtype=int16).
+        Returns a finalized Utterance when END_SILENCE_MS is satisfied; otherwise None.
+        The method must be O(1) per call (no unbounded copies).
+        """
+
+    def flush(self) -> Optional[Utterance]:
+        """
+        Force-finalize any active utterance (e.g., on session end). If there is an
+        active utterance, finalize using current time and return it; otherwise None.
+        """
+```
+
+### Notes on the API
+
+* `feed_frame` is called exactly once per 20 ms chunk. We do **not** pass timestamps; maintain an internal `clock_ms += frame_ms` counter to get absolute times from session start.
+* You must validate `frame_pcm16.dtype == np.int16` and `frame_pcm16.shape == (320,)` or equivalent length based on `frame_ms` and `sample_rate`. Raise `ValueError` if malformed.
+* The **pre-roll** must be sourced from an internal ring buffer sized to at least `PREROLL_MS + 3*FRAME_MS` (headroom).
+
+## State Machine
+
+States: `IDLE`, `IN_SPEECH`.
+
+**Variables** (per instance):
+
+* `clock_ms` (monotonic, increases by `frame_ms` each `feed_frame`)
+* `rb` (ring buffer of int16 frames for pre-roll; capacity in frames = `ceil(PREROLL_MS / FRAME_MS) + 4`)
+* `vad` (webrtcvad.Vad(VAD\_AGGRESSIVENESS))
+* `voiced_run_ms`, `silence_run_ms` (contiguous counters)
+* `utter_start_clock_ms` (int) — set when transitioning to `IN_SPEECH`
+* `active_frames` (list of np.int16 frames) — the in-progress utterance storage
+
+**Transitions**
+
+1. **IDLE → maybe IN\_SPEECH**
+
+   * Push current frame into ring buffer (always).
+   * If `vad.is_speech(frame_bytes, SAMPLE_RATE)` → `voiced_run_ms += FRAME_MS`, else reset `voiced_run_ms=0`.
+   * When `voiced_run_ms >= MIN_SPEECH_MS`, transition to `IN_SPEECH`:
+
+     * Compute `t0_ms = clock_ms - voiced_run_ms - PREROLL_MS` (clamp to ≥0).
+     * Copy up to `PREROLL_MS` worth of frames from ring buffer into `active_frames` (oldest first).
+     * Also include any already-voiced frames that contributed to trigger (i.e., the last `voiced_run_ms / FRAME_MS` frames), ensuring no duplication.
+     * Reset `silence_run_ms = 0`.
+
+2. **IN\_SPEECH**
+
+   * Append current frame to `active_frames`.
+   * If `vad.is_speech(...)` → `silence_run_ms = 0`; else `silence_run_ms += FRAME_MS`.
+   * If `silence_run_ms >= END_SILENCE_MS`, **finalize**:
+
+     * Set `t1_ms = clock_ms - silence_run_ms` (end before trailing silence).
+     * Remove trailing `silence_run_ms / FRAME_MS` frames from `active_frames` so that audio ends at `t1_ms`.
+     * Concatenate frames into a contiguous `np.int16` array.
+     * Compute `voiced_ms` (active voiced run accumulated while IN\_SPEECH) and `frames` count.
+     * Return `Utterance(t0_ms, t1_ms, audio, voiced_ms, silence_tail_ms=silence_run_ms, frames=len(active_frames))` and transition to `IDLE`.
+
+3. **Session end**
+
+   * `flush()` should finalize if `IN_SPEECH` (with no trailing silence trimming) or return None if `IDLE`.
+
+## Pre-roll Ring Buffer
+
+* Implement a minimal ring buffer **inside this module** (OK) or use a tiny `RingBuffer` helper class. API:
+
+  * `push(frame: np.ndarray) -> None`
+  * `dump_last_ms(ms: int) -> List[np.ndarray]` (returns up to N most recent frames; does **not** clear the buffer)
+* Capacity: `cap_frames = ceil((PREROLL_MS + 3*FRAME_MS) / FRAME_MS)`.
+* Store frames by reference; avoid large array concatenations until finalization.
+
+## WebRTC VAD Integration
+
+* `webrtcvad` takes raw bytes, 16-bit PCM little-endian. Convert `frame_pcm16.tobytes()`.
+* Validate that `frame_ms` is **10, 20, or 30**. We will configure to 20. If misconfigured, raise early.
+* `vad_aggressiveness` ∈ {0,1,2,3}; higher means **more likely to reject** borderline speech (fewer false positives, more false negatives). Default: 2.
+
+## Performance & Memory
+
+* O(1) per frame; copying only when finalizing.
+* For a 10-second utterance: < 2 MB transient memory (int16 audio).
+* No third-party deps beyond `webrtcvad`, `numpy`.
+
+## Logging (minimal, no external logger required here)
+
+* Add `_debug` boolean flag to `Endpoint.__init__`. If true, print small trace lines:
+
+  * `clock=XYZ, state=IDLE/IN_SPEECH, vad=0/1, voiced_run_ms=.., silence_run_ms=..`
+  * On transitions (start/finalize), print `START t0_ms=..` / `FINAL t1_ms=.. dur_ms=..`
+
+## Unit Tests (`tests/test_endpoint.py`)
+
+Write robust unit tests using numpy-generated signals plus provided fixtures later. For now:
+
+1. **test\_single\_word\_yes**
+
+   * Generate a 250 ms voiced region (e.g., 220 Hz sine at -12 dBFS) wrapped by 100 ms silence before and after.
+   * Feed as 20 ms frames. Expect exactly 1 `Utterance` with duration \~250–370 ms depending on PREROLL; `t0_ms` should include up to `PREROLL_MS` pre-roll; `t1_ms` should occur before trailing silence.
+
+2. **test\_back\_to\_back\_commands**
+
+   * Two 250 ms voiced islands separated by 300 ms silence.
+   * Expect 2 utterances, non-overlapping, in order.
+
+3. **test\_sentence\_not\_split**
+
+   * 4 seconds of voiced with random 100–180 ms unvoiced dips inserted.
+   * With `END_SILENCE_MS=250`, expect a **single** utterance (dips too short to end).
+
+4. **test\_finalize\_on\_flush**
+
+   * Start speech and then call `flush()` without enough trailing silence. Must finalize whatever is active.
+
+5. **test\_strict\_shape\_and\_dtype**
+
+   * Passing wrong dtype or incorrect length should raise `ValueError`.
+
+For synthetic audio, use helpers in the test file:
+
+```python
+def tone(freq, ms, sr=16000, amp=0.2):
+    t = np.arange(int(sr*ms/1000)) / sr
+    return (amp*np.sin(2*np.pi*freq*t)).astype(np.float32)
+
+def pcm16(x):
+    x = np.clip(x, -1.0, 1.0)
+    return (x * 32767.0).astype(np.int16)
+
+# Silence helper: np.zeros(n, dtype=np.int16)
+```
+
+Note: WebRTC VAD is amplitude-sensitive; for synthetic speech-like noise you may mix tones and noise.
+
+## Edge Cases to Handle
+
+* Very short bursts (< `MIN_SPEECH_MS`): never start an utterance.
+* Long silence while `IN_SPEECH`: end once `END_SILENCE_MS` reached.
+* PREROLL greater than available history: just use what’s available.
+* Continuous speech for many minutes: no memory leak; `active_frames` grows but stays int16 frames; ensure no quadratic concatenations.
+
+## Done Criteria
+
+* All tests pass locally.
+* Manual sanity: when fed a WAV decoded into 20 ms frames, typical single-word commands (“Yes”, “Stop”) produce one utterance each; a 3–6 s sentence yields one utterance.
+* The module is self-contained (only depends on numpy and webrtcvad) and idiomatic.
+
+## Optional (nice-to-have if time permits)
+
+* Expose a `peek_open_duration_ms()` method to allow the server to decide partial decode windows.
+* Emit a small struct on `START` (e.g., start time) via an optional callback; keep default API simple.
+
+## Out of Scope (for this task)
+
+* Whisper decoding
+* Keyword spotting
+* WebSocket server
+* Metrics/telemetry (beyond simple debug prints)
+
+---
+
+**Submission checklist**
+
+* [ ] `sidecar/endpoint.py` with `Endpoint`, `EndpointConfig`, `Utterance` fully implemented
+* [ ] `tests/test_endpoint.py` with the five tests above
+* [ ] Quick README note (inline docstring OK) explaining state machine

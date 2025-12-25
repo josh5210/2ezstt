@@ -1,0 +1,253 @@
+# Agent Prompt — WS Server + Backpressure (Phase 6)
+
+## Context
+
+`ezstt` already has:
+
+* Endpointing (Phase 2)
+* WhisperBackend (Phase 3)
+* Keyword Spotter (Phase 4)
+* Partials Engine (Phase 5)
+
+Phase 6 wraps these in a minimal **WebSocket server** that ingests 20 ms PCM16k frames and emits `partial` and `final` events. The server must remain responsive under load and apply **backpressure** so memory/latency don’t explode.
+
+We target **FastAPI + Uvicorn** with a single `/ws` endpoint. Keep the code modular (one file for server, but clean helpers/classes are fine).
+
+---
+
+## Goals
+
+* Support **binary** frames for audio (recommended) and **JSON base64** (debug).
+* One connection == one **session**. Session carries `session_id`, `speaker_id`, sample rate, and clocks.
+* Maintain **absolute session time** using `time.monotonic_ns()` → ms for `t0/t1` stamps.
+* Provide **backpressure**: cap recv queue; drop oldest frames when overloaded; bound outbound events.
+* Heartbeats / idle timeout; graceful `session.end` and `flush()`.
+* Structured logs and minimal metrics counters.
+
+---
+
+## Configuration (env → defaults)
+
+```
+EZSTT_PORT=8766
+EZSTT_HOST=127.0.0.1
+EZSTT_WS_MAX_MSG_BYTES=2097152    # 2 MB
+EZSTT_SESSION_IDLE_TIMEOUT_MS=5000
+EZSTT_HEARTBEAT_INTERVAL_MS=10000
+EZSTT_RECV_QUEUE_FRAMES=200       # ~4 s of 20 ms frames
+EZSTT_RECV_DROP_POLICY=oldest     # oldest|newest
+EZSTT_OUTBOX_MAX_EVENTS=100       # partial/final queue to client
+EZSTT_AUTH_TOKEN=                 # optional bearer; if set, require Authorization: Bearer <token>
+EZSTT_ACCEPT_JSON_AUDIO=1         # enable base64 JSON chunks for debugging
+EZSTT_LOG_LEVEL=INFO
+```
+
+---
+
+## Message protocol
+
+### Client → Server (JSON control + audio)
+
+* `session.start` (JSON):
+
+```json
+{
+  "type": "session.start",
+  "session_id": "abc123",
+  "speaker_id": "discordUserId",
+  "sample_rate": 16000,
+  "format": "pcm_s16le",
+  "transport": "binary|json",
+  "meta": {"app": "bridge-node", "version": "..."}
+}
+```
+
+* `audio.chunk`: either **binary** 20 ms PCM16k frames (`bytes`), or JSON with base64 if `transport==json`:
+
+```json
+{ "type":"audio.chunk", "seq": 42, "pcm_base64":"...==" }
+```
+
+* `session.end` (JSON): `{ "type": "session.end" }`
+
+### Server → Client (JSON)
+
+* `partial` (from Phase 5 `PartialEvent` shape) — serialized
+* `final` (full utterance result) — include `source: "kws"|"whisper"`
+* `error` `{ code, message }`
+* `metrics` (optional heartbeat payload) `{ recv_queue_frames, dropped_frames, latency_ms, gpu_mem_mb, ... }`
+
+**Note:** outbound events share `utterance_id` so the client can edit a message in place.
+
+---
+
+## Server structure
+
+Create `sidecar/server.py`:
+
+```python
+import asyncio, base64, json, time
+from dataclasses import dataclass
+from typing import Optional, Deque, Callable
+from collections import deque
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header
+from fastapi.responses import PlainTextResponse
+
+from .endpoint import Endpoint, EndpointConfig
+from .whisper_backend import WhisperBackend
+from .kws_vosk import KeywordSpotter, load_grammar
+from .partials import PartialsEngine, PartialsConfig
+
+app = FastAPI()
+
+@dataclass
+class Session:
+    session_id: str
+    speaker_id: str
+    sr: int
+    start_ns: int
+    last_activity_ns: int
+    recv_queue: Deque[np.ndarray]   # frames waiting to be processed
+    dropped_frames: int = 0
+    utterance_id_seq: int = 0
+
+    def now_ms(self) -> int: ...  # (time.monotonic_ns() - start_ns)//1_000_000
+```
+
+### Lifecycle
+
+* On `/ws` connect:
+
+  1. (Optional) Check `Authorization` header if `EZSTT_AUTH_TOKEN` set.
+  2. Expect first message `session.start` (JSON). Validate `sample_rate==16000`.
+  3. Initialize `Session`, `Endpoint`, `PartialsEngine`, backends (Whisper, KWS + grammar).
+  4. Enter recv loop.
+
+### Receive loop
+
+* `await websocket.receive()` repeatedly; branch on type:
+
+  * **Binary**: validate length is multiple of 320 bytes (20 ms \* 16000 \* 2). Slice into 20 ms frames, convert to `np.int16`.
+  * **Text**: parse JSON; accept `audio.chunk` with base64 if allowed; push frames.
+  * Update `session.last_activity_ns` on each message.
+* **Backpressure**: before appending each frame, if `len(recv_queue) >= RECV_QUEUE_FRAMES`:
+
+  * If policy `oldest`: `recv_queue.popleft()` and `dropped_frames += 1`.
+  * Else if `newest`: drop the incoming frame and increment `dropped_frames`.
+* After pushing frames, run a **processing tick** (see below).
+
+### Processing tick (per received message)
+
+* Drain up to `N` frames (e.g., all currently queued) and feed to `Endpoint.feed_frame()`.
+* On transition to speech start, call `partials.on_utterance_start(utterance_id, t0_ms)`.
+* While `feed_frame` returns `None`, keep ticking `partials.on_frame(frame, now_ms)`.
+* If `feed_frame` returns a **finalized Utterance**:
+
+  * Call `partials.on_utterance_end()`.
+  * If duration within KWS window and KWS enabled: try `kws.spot()`; if confident: send `final` with `source:"kws"` and **skip Whisper**.
+  * Else run `WhisperBackend.transcribe()` on the full utterance and emit `final` with `source:"whisper"`.
+
+### Partials emission
+
+* The `PartialsEngine` calls `emit_partial(event)` synchronously. In `server.py`, implement that callback to `await websocket.send_text(json.dumps(...))`. Because we’re in a sync callback, capture events into an **outbox** deque and send them after the processing tick to avoid re-entrancy.
+* Bound the **outbox** to `OUTBOX_MAX_EVENTS` (drop oldest partials first; never drop a final event).
+
+### Idle & heartbeat
+
+* If no frames received and `(now - last_activity) > SESSION_IDLE_TIMEOUT_MS`, then:
+
+  * If endpoint is IN\_SPEECH: call `flush()` → finalize partial utterance.
+  * Close the websocket gracefully with a policy code.
+* Every `HEARTBEAT_INTERVAL_MS`, send a `metrics` event (you can piggyback this onto normal ticks or use a lightweight `asyncio.sleep` task attached to the connection scope).
+
+### Error handling
+
+* Wrap recv loop; on `WebSocketDisconnect` or any Exception, finalize any active utterance via `endpoint.flush()` and attempt to send a `final` if audio exists.
+* Validate inputs strictly (dtype/length) and send `error` events for client mistakes.
+
+---
+
+## Health endpoints
+
+Add simple HTTP routes:
+
+```python
+@app.get("/healthz", response_class=PlainTextResponse)
+async def healthz(): return "ok"
+
+@app.get("/version", response_class=PlainTextResponse)
+async def version(): return "ezstt-0.1"
+```
+
+---
+
+## Tests — `tests/test_ws_server.py`
+
+Use `pytest` + `pytest-asyncio` + `httpx`/`websockets` test client (Starlette’s `TestClient` for HTTP and `fastapi.testclient.WebSocketTestSession` for WS).
+
+1. **test\_happy\_path\_binary**
+
+   * Connect; send `session.start` JSON, then a short binary WAV stream (silence → speech → silence) sliced into 20 ms frames.
+   * Mock WhisperBackend to return a deterministic `final`.
+   * Assert that you receive a sequence of `partial` events followed by exactly one `final` with correct `utterance_id`.
+
+2. **test\_backpressure\_drop\_oldest**
+
+   * Configure small `RECV_QUEUE_FRAMES` (e.g., 10). Send frames faster than processing (mock whisper sleep). Ensure `dropped_frames > 0`, and that memory (queue length) never exceeds the cap.
+
+3. **test\_idle\_timeout\_flushes**
+
+   * Start session, send some voiced frames, then stop sending and advance a fake clock or sleep past idle timeout. Assert that a `final` is emitted via `flush()` and connection closes.
+
+4. **test\_json\_base64\_path**
+
+   * Use JSON `audio.chunk` with base64. Ensure frames are parsed and processed identically to binary.
+
+5. **test\_auth\_required** (if token set)
+
+   * Start server with `EZSTT_AUTH_TOKEN=secret`. Attempt connect without header → expect close. With `Authorization: Bearer secret` → ok.
+
+6. **test\_outbox\_bound**
+
+   * Force partials to be very chatty; ensure `OUTBOX_MAX_EVENTS` is respected and that `final` event is never dropped.
+
+7. **test\_error\_on\_wrong\_sr**
+
+   * Send `session.start` with `sample_rate!=16000` → server sends `error` and closes.
+
+---
+
+## Implementation tips
+
+* Convert binary to frames like:
+
+```python
+for off in range(0, len(data), 320*2):
+    frame = np.frombuffer(data[off:off+320*2], dtype=np.int16)
+    if frame.size == 320:
+        enqueue(frame)
+```
+
+* Keep **all** time math in ms relative to `session.start_ns` using `time.monotonic_ns()`.
+* Favor **drop-oldest** for recv backpressure to keep latency fresh.
+* Use `orjson` if available for faster JSON (optional).
+* Keep server single-process/single-worker initially; add workers later if needed.
+
+---
+
+## Done criteria
+
+* Handles binary and JSON audio inputs.
+* Applies backpressure consistently (bounded queues, counters increment on drops).
+* Emits partials during speech and exactly one final per utterance.
+* Flushes and closes cleanly on idle or client disconnect.
+* All tests pass quickly in CI.
+
+---
+
+## Out of scope
+
+* Multi-connection mixing or cross-session diarization
+* Persistent storage of transcripts
+* TLS and production hardening (can be added later)

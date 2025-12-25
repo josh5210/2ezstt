@@ -1,0 +1,17 @@
+{
+  "language": "en",
+  "entries": [
+    { "id": "yes",     "surfaces": ["yes","yeah","yep","yup","sure"] },
+    { "id": "no",      "surfaces": ["no","nah","nope"] },
+    { "id": "stop",    "surfaces": ["stop","halt","freeze"] },
+    { "id": "go",      "surfaces": ["go","start","begin","resume","continue","run"] },
+    { "id": "left",    "surfaces": ["left"] },
+    { "id": "right",   "surfaces": ["right"] },
+    { "id": "forward", "surfaces": ["forward","forwards","ahead"] },
+    { "id": "back",    "surfaces": ["back","backward","backwards","reverse"] },
+    { "id": "fast",    "surfaces": ["fast","faster"] },
+    { "id": "slow",    "surfaces": ["slow","slower"] },
+    { "id": "up",      "surfaces": ["up"] },
+    { "id": "down",    "surfaces": ["down"] }
+  ]
+}

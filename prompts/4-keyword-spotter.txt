@@ -1,0 +1,185 @@
+# Agent Prompt — Implement Keyword Spotter (Phase 4)
+
+## Context
+
+`ezstt` uses endpointing (Phase 2) to produce trimmed utterance audio. For very short utterances (e.g., 120–500 ms), a lightweight **keyword spotter (KWS)** should recognize a small command vocabulary and return a confident single‑word result. If KWS yields a confident match, emit that as the **final** transcription; otherwise fall back to Whisper (Phase 3).
+
+Per product direction, **do not store the grammar in `.env`**. Instead, load it from a **JSON file** that lives in the repo (e.g., `resources/kws/en.commands.json`).
+
+## Objective
+
+Implement `sidecar/kws_vosk.py` and tests that:
+
+* Load a Vosk model once from a configurable directory
+* Load a **grammar file** (JSON) describing canonical keywords and their surface forms
+* Provide a synchronous `spot()` function for one trimmed utterance (PCM16, 16 kHz mono)
+* Return a decision with confidence and diagnostics
+* Be fast (< 8–15 ms per short utterance on a typical CPU)
+
+## Deliverables
+
+* `sidecar/kws_vosk.py`
+* `tests/test_kws_vosk.py` (mocked Vosk; fast)
+* Optional slow test guarded by env using a real model
+* Inline docs and type hints
+
+## Configuration
+
+Environment variables (kept minimal):
+
+```
+EZSTT_KWS_ENABLE=1
+EZSTT_KWS_MIN_MS=120
+EZSTT_KWS_MAX_MS=500
+EZSTT_KWS_CONF_MIN=0.70
+EZSTT_KWS_MODEL_DIR=C:\Models\vosk\small-en-us
+EZSTT_KWS_GRAMMAR_FILE=resources/kws/en.commands.json
+EZSTT_SR=16000
+```
+
+## Grammar JSON schema
+
+Place the file at `resources/kws/en.commands.json` (path configurable via `EZSTT_KWS_GRAMMAR_FILE`). Example schema:
+
+```json
+{
+  "language": "en",
+  "entries": [
+    { "id": "yes",     "surfaces": ["yes", "yeah", "yep", "yup", "sure"] },
+    { "id": "no",      "surfaces": ["no", "nah", "nope"] },
+    { "id": "stop",    "surfaces": ["stop", "halt", "freeze"] },
+    { "id": "go",      "surfaces": ["go", "start", "begin", "resume", "continue", "run"] },
+    { "id": "left",    "surfaces": ["left"] },
+    { "id": "right",   "surfaces": ["right"] },
+    { "id": "forward", "surfaces": ["forward", "forwards", "ahead"] },
+    { "id": "back",    "surfaces": ["back", "backward", "backwards", "reverse"] },
+    { "id": "fast",    "surfaces": ["fast", "faster"] },
+    { "id": "slow",    "surfaces": ["slow", "slower"] },
+    { "id": "up",      "surfaces": ["up"] },
+    { "id": "down",    "surfaces": ["down"] }
+  ]
+}
+```
+
+Rules:
+
+* Lower‑case everything at load time; dedupe surfaces.
+* Keep entries **single‑word** where possible (KWS is optimized for one token). Multi‑word commands should be handled by Whisper, not KWS.
+
+## Public API
+
+```python
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+import numpy as np
+
+@dataclass
+class KWSMatch:
+    canonical: str
+    surface: str
+    confidence: float
+    start_ms: int
+    end_ms: int
+    engine: str = "vosk"
+
+@dataclass
+class KWSResult:
+    match: Optional[KWSMatch]
+    alternatives: List[KWSMatch]
+    used_vocabulary: List[str]      # all allowed surfaces (lower‑cased)
+    duration_ms: int
+
+@dataclass
+class KWSGrammar:
+    language: str
+    # canonical -> list of surfaces (all lower‑cased)
+    mapping: Dict[str, List[str]]
+
+class KeywordSpotter:
+    def __init__(self,
+                 model_dir: Optional[str],
+                 grammar: Optional[KWSGrammar] = None,
+                 grammar_path: Optional[str] = None,
+                 sample_rate: int = 16000,
+                 conf_min: float = 0.70):
+        """Load Vosk model and a constrained grammar. If `grammar` is None,
+        load from `grammar_path` (JSON schema above). Grammar is case‑insensitive
+        at runtime (we store lower‑cased). Initialization should be idempotent.
+        """
+
+    def spot(self, audio_pcm16: np.ndarray) -> KWSResult:
+        """Run keyword spotting on one utterance (trimmed PCM16 @16k mono).
+        Return a KWSResult with best match if conf >= conf_min; else match=None.
+        Must be fast and side‑effect free.
+        """
+
+# Helpers (module‑level)
+def load_grammar(path: str) -> KWSGrammar: ...
+```
+
+## Behavior
+
+* **Input**: only `np.int16` mono at 16 kHz; invalid input → `ValueError`.
+* **Grammar**: Build a flat allowed surface list and a reverse map `surface -> canonical`. Provide Vosk a JSON array of surfaces (grammar mode). Keep everything lower‑cased.
+* **Recognition**: Use `vosk.Model(model_dir)` once; per call create `KaldiRecognizer(model, sample_rate, grammar_json)`. Feed entire buffer via `AcceptWaveform(audio_bytes)`, parse `Result()` JSON.
+* **Scoring**: If `result.text` empty → no‑match. If present, split on whitespace and keep the token that appears in the allowed surface set with the **highest** `conf` from `result.result`. Confidence is 0..1. For multi‑token outputs, pick the best in‑vocab token.
+* **Mapping**: Map the chosen surface → canonical via the reverse map.
+* **Return rule**: If `conf >= conf_min` and token ∈ vocab → `match`; else `match=None`.
+* **Alternatives**: It’s acceptable to return only the chosen token as alternatives for now.
+
+## Threading & Performance
+
+* Reuse a single `vosk.Model` instance in the class; recognizer per call.
+* Minimize allocations; avoid resampling here.
+
+## Errors
+
+* Missing model path → `RuntimeError` with helpful message.
+* Missing grammar file or invalid JSON → `RuntimeError` detailing path.
+
+## Unit Tests (`tests/test_kws_vosk.py`)
+
+Mock `vosk.Model` and `vosk.KaldiRecognizer`:
+
+1. **test\_load\_grammar\_file**: temp JSON file with 2 entries; ensure mapping built, lower‑cased, deduped.
+2. **test\_valid\_yes\_single\_token**: mock `Result()` → `{ "text":"yeah", "result":[{"word":"yeah","conf":0.82}] }`; expect `match.canonical=="yes"` with conf≈0.82.
+3. **test\_no\_match\_below\_threshold**: empty `text` → `match is None`.
+4. **test\_maps\_to\_canonical**: surface `"okay"` maps to canonical `"ok"` if present in grammar.
+5. **test\_invalid\_audio\_raises**: wrong dtype/shape → `ValueError`.
+6. **test\_missing\_files\_raise**: bad model dir or grammar path → `RuntimeError`.
+7. **test\_duration\_reported**: duration\_ms equals input length / 16 kHz.
+
+Optional slow test (skipped by default):
+8\. **test\_integration\_slow**: if `EZSTT_RUN_SLOW_TESTS=1` and both paths exist, run a quick spot on a tiny WAV (don’t assert text content).
+
+## Example usage in server
+
+```python
+from sidecar.kws_vosk import KeywordSpotter, load_grammar
+import os
+
+kws = KeywordSpotter(
+    model_dir=os.getenv("EZSTT_KWS_MODEL_DIR"),
+    grammar=load_grammar(os.getenv("EZSTT_KWS_GRAMMAR_FILE", "resources/kws/en.commands.json")),
+    sample_rate=int(os.getenv("EZSTT_SR", "16000")),
+    conf_min=float(os.getenv("EZSTT_KWS_CONF_MIN", "0.7")),
+)
+res = kws.spot(audio_pcm16)
+if res.match and res.match.confidence >= kws.conf_min:
+    # emit final { text=res.match.canonical, conf=res.match.confidence, source:"kws" }
+else:
+    # fall back to WhisperBackend.transcribe(...)
+```
+
+## Done Criteria
+
+* KWS returns correct canonical token for short commands with confidence ≥ threshold.
+* All unit tests pass without a real Vosk model.
+* Optional slow test works locally when enabled and a model is available.
+* Grammar is owned in a JSON file (not .env) and easy to extend.
+
+## Out of Scope
+
+* Wake‑word detection
+* Multi‑word commands (let Whisper handle)
+* Streaming partials

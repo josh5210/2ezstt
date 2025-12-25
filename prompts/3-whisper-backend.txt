@@ -1,0 +1,230 @@
+# Agent Prompt — Implement `whisper_backend.py` (ezstt Phase 3)
+
+## Context
+
+We’re rebuilding STT as **ezstt**. Phase 2 (endpointing) cleanly detects utterance start/end. Phase 3 provides a thin, reliable wrapper over **faster‑whisper** (CTranslate2) to decode a single utterance quickly and accurately. The backend must be simple, deterministic, and easy to test/mocks.
+
+We already ran faster‑whisper **medium** on this machine in the previous project with CUDA. Keep default behavior optimized for **low latency** on GPU, but must run on CPU as a fallback.
+
+## Objective
+
+Implement `sidecar/whisper_backend.py` that:
+
+* Initializes a `WhisperModel` once and reuses it.
+* Exposes a single method to transcribe one utterance (PCM16 16 kHz mono), with options for:
+
+  * language (default `en`)
+  * device (`auto` → cuda if available else cpu)
+  * compute type (`float16` on cuda, `int8` on cpu by default)
+  * short‑audio padding (left/right) when utterance is very short
+  * decoding params tuned for speed (greedy or beam size 1)
+* Returns text + lightweight metadata (confidence, segments with timestamps, token count, timings).
+* **Do not** use Whisper’s VAD; endpointing handles that.
+* **Do not** condition on previous text.
+
+## Deliverables
+
+* `sidecar/whisper_backend.py`
+* Unit tests: `tests/test_whisper_backend.py`
+* (Optional slow) Integration smoke test guarded by env flag
+* Inline docs for public API and config
+
+## Dependencies
+
+Assume these are already installed (or will be installed) in the venv:
+
+* `faster-whisper`
+* `numpy`, `pydantic` (or `dataclasses`) for return types
+* `pytest`, `pytest-mock`
+
+## Config & Defaults
+
+Hard‑code safe defaults but read from env if present (a separate config layer can map env → kwargs later). Suggested variables:
+
+```
+MODEL_NAME = os.getenv("EZSTT_MODEL", "medium")
+DEVICE = os.getenv("EZSTT_DEVICE", "auto")        # "auto" | "cuda" | "cpu"
+COMPUTE_TYPE = os.getenv("EZSTT_COMPUTE_TYPE", "auto")
+CPU_THREADS = int(os.getenv("EZSTT_CPU_THREADS", "4"))
+BEAM_SIZE = int(os.getenv("EZSTT_BEAM_SIZE", "1"))    # keep 1 for speed
+BEST_OF = int(os.getenv("EZSTT_BEST_OF", "1"))        # keep 1 for speed
+LANG = os.getenv("EZSTT_LANG", "en")
+PAD_SHORT_MS = int(os.getenv("EZSTT_PAD_SHORT_MS", "450"))
+MAX_UTTER_MS = int(os.getenv("EZSTT_MAX_UTTER_MS", "30000"))  # safety cap 30s
+MODEL_CACHE_DIR = os.getenv("EZSTT_MODEL_DIR")  # optional custom dir
+```
+
+Computed defaults:
+
+* If `DEVICE == "auto"`: try cuda; if load fails, fall back to cpu.
+* If `COMPUTE_TYPE == "auto"`: `float16` on cuda, `int8` on cpu.
+
+## Public API
+
+from dataclasses import dataclass
+from typing import List, Optional
+import numpy as np
+
+
+@dataclass
+class WhisperSegment:
+start_ms: int
+end_ms: int
+text: str
+avg_logprob: Optional[float] = None
+no_speech_prob: Optional[float] = None
+
+
+@dataclass
+class WhisperResult:
+text: str
+confidence: float # 0..1 heuristic
+segments: List[WhisperSegment]
+tokens: Optional[int]
+time_ms: Optional[int] # total decode time
+device: str # "cuda" or "cpu"
+compute_type: str # e.g., "float16", "int8"
+used_padding_ms: int # how much left+right padding was applied
+
+
+class WhisperBackend:
+def __init__(self,
+model_name: str = MODEL_NAME,
+device: str = DEVICE,
+compute_type: str = COMPUTE_TYPE,
+model_cache_dir: Optional[str] = MODEL_CACHE_DIR,
+cpu_threads: int = CPU_THREADS,
+beam_size: int = BEAM_SIZE,
+best_of: int = BEST_OF,
+default_lang: str = LANG,
+pad_short_ms: int = PAD_SHORT_MS):
+"""Load or lazily load the model with chosen device/compute_type.
+Must never enable vad_filter. Must not condition on previous text.
+"""
+
+
+def transcribe(self,
+audio_pcm16: np.ndarray,
+sr: int = 16000,
+lang: Optional[str] = None,
+time_offset_ms: int = 0,
+context_left_pcm16: Optional[np.ndarray] = None,
+context_right_pcm16: Optional[np.ndarray] = None) -> WhisperResult:
+"""Transcribe a single utterance.
+- `audio_pcm16`: int16 mono 16 kHz.
+- If the utterance is shorter than `pad_short_ms`, left/right pad with
+provided context if available, else symmetric zero‑pad.
+- `time_offset_ms` is added to segment times (allows caller to map to
+absolute session timeline). If left padding is used, subtract that
+amount before applying `time_offset_ms` so returned times align to the
+original utterance.
+Returns a `WhisperResult`.
+"""
+
+
+
+Behavior & Implementation Details
+
+Input validation: ensure dtype=int16, mono, and sr==16000; raise ValueError if not.
+
+Normalization: convert to float32 in −1..1: x_float = audio.astype(np.float32) / 32768.0.
+
+Padding: if len(audio) < sr * pad_short_ms/1000, compute need = target_ms - dur_ms and split left = need//2, right = need - left. Prefer provided context_left_pcm16/context_right_pcm16 (trim or take tail/head), otherwise pad with zeros. Track used_padding_ms = left_ms + right_ms. Keep a left_shift_ms = left_ms to later adjust segment times.
+
+
+Model init (lazy or eager):
+
+from faster_whisper import WhisperModel
+try:
+self.model = WhisperModel(model_name,
+device=resolved_device, # "cuda" or "cpu"
+compute_type=resolved_type, # "float16" or "int8"
+download_root=model_cache_dir,
+cpu_threads=cpu_threads)
+except Exception:
+# if device was auto/cuda and failed, fall back to cpu/int8
+
+
+Decode call: Use greedy path: beam_size=1, best_of=1, vad_filter=False, condition_on_previous_text=False. Pass language=lang or default_lang. Request timestamps (not without_timestamps).
+
+Aggregation: collect segments: for seg in segments: start = ms(seg.start), end = ms(seg.end) ... adjusting times by -left_shift_ms + time_offset_ms and never negative.
+
+Confidence: heuristic:
+
+Compute avg_logprob over segments (ignore None). Map to 0..1 with sigmoid(avg_logprob); then penalize if the model emitted empty text or high average no_speech_prob (>0.5). Clamp 0..1.
+
+Tokens: if info exposes duration/language, include; if token count is exposed, report it; otherwise set None.
+
+Timing: measure wall time of the decode and return in time_ms.
+
+
+Unit Tests (fast, no large model download)
+
+Implement with monkeypatch/mocks to avoid loading actual Whisper weights in CI. Create a tiny fake MockModel that mimics WhisperModel.transcribe() signature and yields a few mock segment objects and a simple info.
+
+Tests in tests/test_whisper_backend.py:
+
+test_validation: wrong dtype/shape/sr → ValueError.
+
+test_auto_device_resolve: when device="auto" and mock cuda load raises, fallback to cpu with compute_type int8.
+
+test_short_audio_padding_prefers_context:
+
+Provide 200 ms utterance with 300 ms left context and 300 ms right context.
+
+Ensure the model receives ~>=450 ms padded audio.
+
+Verify returned segment times are shifted back (no left‑pad bias) and used_padding_ms>0.
+
+test_confidence_heuristic: mock avg_logprob high → conf near 1; high no_speech_prob or empty text → conf < 0.5.
+
+test_time_offset: with time_offset_ms=1000 and left pad 100 ms, ensure a segment starting at 0 in model output becomes ~900 ms in result.
+
+test_params_passed: ensure vad_filter=False and condition_on_previous_text=False are always used.
+
+Add an optional slow test guarded by env (skipped by default): 7. test_integration_slow (requires model): if os.getenv("EZSTT_RUN_SLOW_TESTS") == "1", load real WhisperModel(model_name) on cpu and run on a small synthetic audio (e.g., 1 s of tone + zeros) just to ensure the call path doesn’t crash. Don’t assert text content.
+
+
+Example Smoke Script (for humans, not for tests)
+
+Create tools/smoke_whisper_backend.py:
+
+import numpy as np
+from sidecar.whisper_backend import WhisperBackend
+
+
+if __name__ == "__main__":
+# 0.6 s of synthetic audio (silence)
+sr = 16000
+x = np.zeros(int(0.6 * sr), dtype=np.int16)
+wb = WhisperBackend()
+res = wb.transcribe(x, sr=sr)
+print("device=", res.device, "compute_type=", res.compute_type, "time_ms=", res.time_ms)
+print("text=", repr(res.text))
+
+
+Done Criteria
+
+All unit tests pass without downloading real models.
+
+Optional slow integration test passes locally when enabled.
+
+The backend can be called repeatedly without reloading the model.
+
+Short utterances are padded and timestamp‑adjusted as specified.
+
+No usage of Whisper’s built‑in VAD or previous‑text conditioning.
+
+Out of Scope
+
+WebSocket server
+
+Endpointing/VAD
+
+Keyword spotting
+
+Multi‑utterance context or diarization
+
+Notes for Reviewers
+
+Keep external API stable. We will call WhisperBackend.transcribe() from the WS server using time_offset_ms set to the utterance’s absolute start time, and we may pass context_left/right extracted from the endpoint ring buffer for better short‑audio decoding.

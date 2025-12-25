@@ -1,0 +1,285 @@
+# Agent Prompt — Phase 7: Discord Client Patch (stream → ezstt, show partials/finals)
+
+## Context
+
+Server (Phase 6) exposes `/ws` for 20 ms PCM16k frames with `session.start` / `audio.chunk` / `session.end` messages. We now need a Discord client that:
+
+* Joins a voice channel
+* Receives user audio, decodes Opus → PCM
+* Resamples to **16 kHz mono**, slices into **20 ms frames**
+* Opens **one WS session per active speaker** and streams frames
+* Consumes server events (`partial`/`final`) and displays them in a **transcript text channel** (edit‑in‑place for partials)
+
+Keep it **small and reliable**. Assume Node 18+.
+
+## Deliverables
+
+* `client/discord_stream.ts` (entrypoint CLI)
+* `client/ws_session.ts` (WS session helper)
+* `client/audio/frame_chunker.ts` (20 ms slicer)
+* Optional: `types/events.ts` (shared event types)
+* Jest tests for frame chunker + basic WS session behavior (mocked)
+
+## Dependencies (add to package.json)
+
+```json
+{
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "@discordjs/voice": "^0.16.1",
+    "prism-media": "^1.3.5",
+    "ffmpeg-static": "^5.2.0",
+    "ws": "^8.18.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "ts-node": "^10.9.2",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "@types/jest": "^29.5.12",
+    "@types/ws": "^8.5.10",
+    "@types/node": "^20.12.12"
+  }
+}
+```
+
+> Notes:
+>
+> * We use `ffmpeg-static` so we don’t rely on system PATH. Wire its path into `prism-media`’s FFmpeg spawn.
+> * `prism-media` handles Opus decode. Resampling to 16k is done via FFmpeg.
+
+## Environment (.env)
+
+```
+DISCORD_TOKEN=your-bot-token
+GUILD_ID=...
+VOICE_CHANNEL_ID=...
+TRANSCRIPT_CHANNEL_ID=...
+EZSTT_WS_URL=ws://127.0.0.1:8766/ws
+PARTIALS_ENABLE=1
+```
+
+## Runtime behavior
+
+* On startup, login, fetch guild/voice channel, **join** with `joinVoiceChannel`.
+* Create a `receiver` and listen to `receiver.speaking.on('start', userId)` / `'end'`.
+* On `start` for a user:
+
+  1. Build a pipeline: `OpusStream -> PCM 48k stereo -> FFmpeg resample -> FrameChunker 20 ms -> WSSession`.
+  2. Open a WS with `session.start { session_id, speaker_id: userId, sample_rate: 16000, transport: "binary" }`.
+  3. Begin sending `audio.chunk` frames as **binary**.
+* On `end` for a user: call `WSSession.end()` (send `session.end`) and close.
+* For **partials/finals** received from server: maintain a map `utteranceId -> messageId`. Post a message on first partial, then **edit** on subsequent partials (same `utterance_id`). Replace with **final** when received.
+
+## File: `client/audio/frame_chunker.ts`
+
+Implement a Node stream `FrameChunker` that consumes **s16le** PCM and outputs **exactly 640‑byte** chunks (20 ms @ 16k mono, 320 samples \* 2 bytes):
+
+```ts
+import { Transform, TransformCallback } from 'node:stream';
+
+export class FrameChunker extends Transform {
+  private carry: Buffer = Buffer.alloc(0);
+  constructor(private readonly bytesPerFrame = 320 * 2) { super({ readableObjectMode: true }); }
+  _transform(chunk: Buffer, _: BufferEncoding, cb: TransformCallback) {
+    this.carry = Buffer.concat([this.carry, chunk]);
+    while (this.carry.length >= this.bytesPerFrame) {
+      const out = this.carry.subarray(0, this.bytesPerFrame);
+      this.push(out); // push Buffer frame
+      this.carry = this.carry.subarray(this.bytesPerFrame);
+    }
+    cb();
+  }
+  _flush(cb: TransformCallback) {
+    // drop tail; endpointer server handles padding/silence
+    this.carry = Buffer.alloc(0);
+    cb();
+  }
+}
+```
+
+## File: `client/ws_session.ts`
+
+A tiny helper that opens a WebSocket to ezstt and writes frames with **drop‑oldest** backpressure.
+
+```ts
+import WebSocket from 'ws';
+
+export type OutEvent = { type: 'partial'|'final'|'error'|'metrics'; [k: string]: any };
+
+export class WSSession {
+  private ws?: WebSocket;
+  private queue: Buffer[] = [];
+  private maxQueue = 200; // ~4s
+  private open = false;
+  constructor(private url: string, private meta: { sessionId: string; speakerId: string; sampleRate?: number }) {}
+
+  connect(onEvent: (ev: OutEvent)=>void): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.ws = new WebSocket(this.url, { perMessageDeflate: false });
+      this.ws.on('open', () => {
+        this.open = true;
+        const start = { type: 'session.start', session_id: this.meta.sessionId, speaker_id: this.meta.speakerId, sample_rate: this.meta.sampleRate ?? 16000, format: 'pcm_s16le', transport: 'binary', meta: { app: 'ezstt-client' } };
+        this.ws!.send(JSON.stringify(start));
+        resolve();
+      });
+      this.ws.on('message', (data) => {
+        try { onEvent(JSON.parse(data.toString('utf8')) as OutEvent); } catch {}
+      });
+      this.ws.on('close', () => { this.open = false; });
+      this.ws.on('error', (e) => { reject(e); });
+    });
+  }
+
+  writeFrame(frame: Buffer) {
+    if (!this.ws || !this.open) return;
+    // backpressure: drop oldest when too many
+    if (this.queue.length >= this.maxQueue) this.queue.shift();
+    this.queue.push(frame);
+    this.flush();
+  }
+
+  private flushing = false;
+  private flush() {
+    if (this.flushing || !this.ws || !this.open) return;
+    this.flushing = true;
+    while (this.queue.length && this.open) {
+      const buf = this.queue.shift()!;
+      // Send as raw binary. Server slices into frames already aligned to 20ms
+      this.ws!.send(buf, { binary: true });
+    }
+    this.flushing = false;
+  }
+
+  end() {
+    if (!this.ws) return;
+    try { this.ws.send(JSON.stringify({ type: 'session.end' })); } catch {}
+    this.ws.close();
+    this.open = false;
+    this.queue = [];
+  }
+}
+```
+
+## File: `client/discord_stream.ts`
+
+Main script: join channel, receive audio, resample via ffmpeg, chunk, stream, and post transcript messages.
+
+```ts
+import 'dotenv/config';
+import { Client, Events, GatewayIntentBits, TextChannel } from 'discord.js';
+import { joinVoiceChannel, EndBehaviorType, getVoiceConnection, createAudioReceiveStream, VoiceConnection } from '@discordjs/voice';
+import prism from 'prism-media';
+import ffmpeg from 'ffmpeg-static';
+import { spawn } from 'node:child_process';
+import { FrameChunker } from './audio/frame_chunker';
+import { WSSession } from './ws_session';
+import { randomUUID } from 'node:crypto';
+
+const TOKEN = process.env.DISCORD_TOKEN!;
+const GUILD_ID = process.env.GUILD_ID!;
+const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID!;
+const TRANSCRIPT_CHANNEL_ID = process.env.TRANSCRIPT_CHANNEL_ID!;
+const WS_URL = process.env.EZSTT_WS_URL!;
+const PARTIALS_ENABLE = process.env.PARTIALS_ENABLE !== '0';
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+
+// Track per-utterance message mapping for edit-in-place
+const partialMessages = new Map<string, string>(); // utteranceId -> messageId
+
+function ensureJoined(): VoiceConnection {
+  const existing = getVoiceConnection(GUILD_ID);
+  if (existing) return existing;
+  return joinVoiceChannel({ channelId: VOICE_CHANNEL_ID, guildId: GUILD_ID, adapterCreator: client.guilds.cache.get(GUILD_ID)!.voiceAdapterCreator });
+}
+
+function makePipeline(vc: VoiceConnection, userId: string, onEvent: (ev: any)=>void) {
+  const receiver = vc.receiver;
+  const opus = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 } });
+  const opusDecoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 }); // 20ms @48k
+  const ff = spawn(ffmpeg as string, ['-hide_banner','-loglevel','error','-f','s16le','-ar','48000','-ac','2','-i','pipe:0','-f','s16le','-ar','16000','-ac','1','pipe:1']);
+  opus.pipe(opusDecoder).pipe(ff.stdin);
+  const chunker = new FrameChunker();
+  ff.stdout.pipe(chunker);
+
+  const session = new WSSession(WS_URL, { sessionId: randomUUID(), speakerId: userId });
+  const ready = session.connect(onEvent);
+
+  chunker.on('data', (frame: Buffer) => { session.writeFrame(frame); });
+  chunker.on('close', () => session.end());
+  opus.on('end', () => { try { ff.stdin.end(); } catch {} });
+  ff.on('close', () => { session.end(); });
+
+  return { session, cleanup: () => { try { opus.destroy(); } catch {} try { ff.kill('SIGKILL'); } catch {} session.end(); } };
+}
+
+async function postOrEditPartial(channel: TextChannel, ev: any) {
+  if (!PARTIALS_ENABLE) return;
+  const key = ev.utterance_id;
+  const content = `*(partial · rev ${ev.revision})*\n${ev.text.slice(0,160)}`;
+  const msgId = partialMessages.get(key);
+  if (msgId) {
+    try { const msg = await channel.messages.fetch(msgId); await msg.edit(content); } catch {}
+  } else {
+    const msg = await channel.send(content);
+    partialMessages.set(key, msg.id);
+  }
+}
+
+async function replaceWithFinal(channel: TextChannel, ev: any) {
+  const key = ev.utterance_id;
+  const content = `**${ev.text}**\n\`\`\`json\n${JSON.stringify({ source: ev.source, conf: ev.confidence }, null, 2)}\n\`\`\``;
+  const msgId = partialMessages.get(key);
+  if (msgId) {
+    try { const msg = await channel.messages.fetch(msgId); await msg.edit(content); } catch { await channel.send(content); }
+    partialMessages.delete(key);
+  } else {
+    await channel.send(content);
+  }
+}
+
+client.once(Events.ClientReady, async () => {
+  console.log(`Logged in as ${client.user?.tag}`);
+  const channel = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID) as TextChannel;
+  const vc = ensureJoined();
+  const active = new Map<string, ReturnType<typeof makePipeline>>();
+
+  vc.receiver.speaking.on('start', async (userId) => {
+    if (active.has(userId)) return; // prevent dup
+    const pipeline = makePipeline(vc, userId, async (ev) => {
+      if (ev.type === 'partial') await postOrEditPartial(channel, ev);
+      else if (ev.type === 'final') await replaceWithFinal(channel, ev);
+      else if (ev.type === 'error') console.warn('server error', ev);
+    });
+    active.set(userId, pipeline);
+  });
+  vc.receiver.speaking.on('end', (userId) => {
+    const p = active.get(userId); if (!p) return;
+    p.cleanup();
+    active.delete(userId);
+  });
+});
+
+client.login(TOKEN);
+```
+
+## Tests
+
+* `frame_chunker.test.ts`: feed varying chunk sizes; assert output frames are all 640 bytes; confirm leftover is dropped on flush.
+* `ws_session.test.ts`: mock `ws` to ensure `session.start` is sent, binary frames go through, queue bounds respected (drop‑oldest), and `session.end` sent on `.end()`.
+
+## Operational notes
+
+* **Latency**: Keep FFmpeg resample alive per speaker; avoid respawning on tiny gaps (the `AfterSilence` behavior already closes after 1s idle).
+* **Backpressure client‑side**: the queue in `WSSession` caps at \~4 s; with drop‑oldest, this favors fresher audio if server stalls.
+* **Permissions**: the bot must have `Connect`, `View Channel`, `Read Message History`, `Send Messages`, and `Manage Messages` (to edit partials). If “Manage Messages” is not allowed, fall back to posting new messages.
+* **Error handling**: If WS closes, end pipeline gracefully and allow `speaking.start` to create a new session on next talk.
+
+## Done criteria
+
+* Bot joins voice, captures audio, streams to ezstt, and posts partials/finals in the transcript channel.
+* One WS per active speaker; sessions end on silence.
+* Frame size is exactly 20 ms @ 16 kHz mono (640 bytes per chunk).
+* Partials are edited in place; finals replace them.
