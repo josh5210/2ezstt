@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
 import http from 'node:http';
 import { FrameChunker } from './audio/frame_chunker';
+import { AudioGate } from './audio/audio_gate';
 import { WSSession } from './ws_session';
 import type { OutEvent } from './ws_session';
 import { sendFinalSimpleMessage } from './finals_channel';
@@ -466,15 +467,63 @@ function makePipeline(vc: VoiceConnection, userId: string, onEvent: (ev: OutEven
   const chunker = new FrameChunker();
   ff.stdout.pipe(chunker);
 
-  const session = new WSSession(WS_URL, { sessionId: randomUUID(), speakerId: userId });
-  session
-    .connect(onEvent)
-    .catch((err) => console.error('ws connect error', err));
-
-  chunker.on('data', (frame: Buffer) => {
-    session.writeFrame(frame);
+  // AudioGate: only create session when real voice is detected
+  const gate = new AudioGate({
+    minFrames: 3,        // 60ms minimum
+    minVoicedFrames: 2,  // At least 2 frames with voice
+    rmsThreshold: 0.02,  // RMS threshold for voice detection
+    debug: process.env.AUDIO_GATE_DEBUG === '1',
   });
-  chunker.on('close', () => session.end());
+
+  let session: WSSession | null = null;
+  let sessionConnecting = false;
+
+  gate.on('open', () => {
+    // Voice detected - create and connect session
+    if (session || sessionConnecting) return;
+    sessionConnecting = true;
+    
+    const newSession = new WSSession(WS_URL, { sessionId: randomUUID(), speakerId: userId });
+    newSession
+      .connect(onEvent)
+      .then(() => {
+        session = newSession;
+        sessionConnecting = false;
+        console.log(`[AudioGate] Session created for user=${userId}`);
+      })
+      .catch((err) => {
+        console.error('[AudioGate] ws connect error', err);
+        sessionConnecting = false;
+      });
+  });
+
+  gate.on('frame', (frame: Buffer) => {
+    // Forward frames to session (session may still be connecting for first few frames)
+    if (session) {
+      session.writeFrame(frame);
+    }
+  });
+
+  gate.on('close', () => {
+    // Gate closed - end session if it exists
+    if (session) {
+      session.end();
+    }
+  });
+
+  gate.on('discard', ({ frames, reason }: { frames: number; reason: string }) => {
+    console.log(`[AudioGate] Discarded ${frames} frames (${reason}) for user=${userId} - no session created`);
+  });
+
+  // Route chunker output through the gate
+  chunker.on('data', (frame: Buffer) => {
+    gate.push(frame);
+  });
+
+  chunker.on('close', () => {
+    gate.end();
+  });
+
   opus.on('end', () => {
     try {
       ff.stdin.end();
@@ -482,12 +531,14 @@ function makePipeline(vc: VoiceConnection, userId: string, onEvent: (ev: OutEven
       /* noop */
     }
   });
+
   ff.on('close', () => {
-    session.end();
+    gate.end();
   });
 
   return {
-    session,
+    session: null as WSSession | null, // Session is created lazily
+    gate,
     cleanup: () => {
       try {
         opus.destroy();
@@ -499,7 +550,7 @@ function makePipeline(vc: VoiceConnection, userId: string, onEvent: (ev: OutEven
       } catch {
         /* noop */
       }
-      session.end();
+      gate.end();
     },
   };
 }
