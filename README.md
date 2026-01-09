@@ -114,6 +114,7 @@ EZSTT is a dual-component system consisting of a Python-based STT server (`sidec
 #### 1. Discord Audio Client (`client/`)
 - **Primary Entry**: `discord_stream.ts` - Main Discord bot orchestrating voice capture and transcription display
 - **Audio Processing**: `audio/frame_chunker.ts` - Converts streaming audio into fixed-size frames (320 bytes/20ms)
+- **Voice Activity Gate**: `audio/audio_gate.ts` - Client-side voice detection to prevent spurious sessions
 - **WebSocket Interface**: `ws_session.ts` - Manages STT server communication with session lifecycle
 - **Output Formatting**: `finals_channel.ts` - Handles clean final transcript delivery to designated channels
 
@@ -134,9 +135,62 @@ Discord Voice Channel
 │  └─ prism-media decoder
 │     └─ FFmpeg resample (16kHz mono PCM16)
 │        └─ FrameChunker (320 bytes/20ms frames)
-│           └─ WebSocket binary frames
-│              └─ STT Server endpoint
+│           └─ AudioGate (voice activity detection)
+│              ├─ Discarded (no voice detected)
+│              └─ Voice confirmed → WebSocket session created
+│                 └─ Binary frames → STT Server endpoint
 ```
+
+### AudioGate: Client-Side Voice Detection
+
+The `AudioGate` prevents spurious STT sessions by buffering audio locally and only creating WebSocket connections when actual speech is detected. This is a critical optimization that:
+
+- **Reduces GPU load**: No transcription attempts on silence/noise
+- **Reduces network traffic**: No WebSocket connections until voice confirmed
+- **Preserves sentence beginnings**: Rolling buffer includes pre-detection audio
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     AudioGate Flow                       │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  Frame arrives ──► Buffer (up to 50 frames)             │
+│                         │                                │
+│                         ▼                                │
+│               Calculate RMS Energy                       │
+│                         │                                │
+│            ┌────────────┴────────────┐                   │
+│            ▼                         ▼                   │
+│     RMS < threshold           RMS ≥ threshold            │
+│     (silence/noise)           (voiced frame)             │
+│            │                         │                   │
+│            ▼                         ▼                   │
+│    Continue buffering         Increment voiced count     │
+│            │                         │                   │
+│            ▼                         ▼                   │
+│   ┌────────────────┐      ┌─────────────────────┐       │
+│   │ Max buffer or  │      │ minVoicedFrames met │       │
+│   │ timeout reached│      │ within minFrames?   │       │
+│   └───────┬────────┘      └──────────┬──────────┘       │
+│           ▼                          ▼                   │
+│     DISCARD buffer            OPEN gate                  │
+│     (no session created)      ├─ Emit 'open' event       │
+│                               ├─ Create WebSocket        │
+│                               ├─ Flush buffered frames   │
+│                               └─ Stream new frames       │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Hardware/Network Impact Summary:**
+
+| Resource | Impact | Details |
+|----------|--------|---------|
+| Client GPU | None | No ML on client; pure CPU/memory |
+| Server GPU | **↓ Reduced** | Fewer spurious sessions = fewer inference attempts |
+| Network | **↓ Reduced** | No traffic until voice confirmed |
+| Client Memory | +32KB/speaker | Circular buffer (50 frames × 640 bytes) |
+| Client CPU | +0.001ms/frame | RMS calculation is trivial |
 
 ### STT Processing Flow
 ```
@@ -251,6 +305,7 @@ STT Server Events
 - `FINALS_TRANSCRIPT_CHANNEL_ID` - Optional clean finals-only channel
 - `EZSTT_WS_URL` - STT server WebSocket endpoint
 - `PARTIALS_ENABLE` - Toggle partial transcript display (default: enabled)
+- `AUDIO_GATE_DEBUG` - Enable verbose AudioGate logging (default: disabled, set to `1` to enable)
 
 #### Environment Variables (Server)
 - `EZSTT_MODEL` - Whisper model size (default: "medium")
@@ -259,6 +314,7 @@ STT Server Events
 - `EZSTT_BEAM_SIZE` - Whisper beam search size (default: 1)
 - `EZSTT_PAD_SHORT_MS` - Minimum utterance padding (default: 450ms)
 - `EZSTT_MAX_UTTER_MS` - Maximum utterance length (default: 30s)
+- `EZSTT_LOG_LEVEL` - Server log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`)
 
 ### Extension Points for Future AI Integration
 
@@ -309,12 +365,92 @@ STT Server Events
 }
 ```
 
+## Debugging & Troubleshooting
+
+### Debug Environment Variables
+
+Enable verbose logging for troubleshooting:
+
+```bash
+# Client-side: AudioGate voice detection logs
+AUDIO_GATE_DEBUG=1
+
+# Server-side: Full debug logging (session lifecycle, VAD, transcription)
+EZSTT_LOG_LEVEL=DEBUG
+```
+
+### Debug Output Examples
+
+**AudioGate Debug** (`AUDIO_GATE_DEBUG=1`):
+```
+[AudioGate] frame=1 buffered=1 voiced=0 rms=0.0012
+[AudioGate] frame=2 buffered=2 voiced=0 rms=0.0018
+[AudioGate] frame=3 buffered=3 voiced=1 rms=0.0234
+[AudioGate] frame=4 buffered=4 voiced=2 rms=0.0456
+[AudioGate] OPEN reason=voice_detected buffered=4 voiced=2
+[AudioGate] Session ready for user=123456789, flushed 4 pending frames
+```
+
+**Server Debug** (`EZSTT_LOG_LEVEL=DEBUG`):
+```
+[Session abc123] LIFECYCLE: created -> handshake_complete
+[Session abc123] RX binary: 640 bytes (total: 1 binary, 0 json)
+[Endpoint abc123] VAD state: IDLE -> IN_SPEECH (frame=5)
+[Endpoint abc123] stats: frames=50 voiced=38 transitions=2
+[Session abc123] LIFECYCLE: active -> closing:peer_disconnect
+```
+
+### Common Issues
+
+| Symptom | Likely Cause | Solution |
+|---------|--------------|----------|
+| Sessions with 0 frames | Client creating sessions before audio flows | AudioGate should prevent this; check `AUDIO_GATE_DEBUG` |
+| Clipped sentence beginnings | RMS threshold too high or buffer too small | Lower `rmsThreshold` or increase `minFrames` |
+| Too many spurious sessions | RMS threshold too low | Raise `rmsThreshold` |
+| No transcriptions | WebSocket not connecting | Check `EZSTT_WS_URL` and server status |
+| High latency | Model too large or CPU-only | Use smaller model or enable CUDA |
+
+### AudioGate Tuning Parameters
+
+Adjust in `client/discord_stream.ts` within `makePipeline()`:
+
+```typescript
+const gate = new AudioGate({
+  minFrames: 3,        // Minimum frames before checking voice (60ms)
+  minVoicedFrames: 2,  // Required voiced frames to trigger
+  rmsThreshold: 0.015, // RMS energy threshold (0.0-1.0)
+  maxBufferFrames: 50, // Max buffer before force-discard (1 second)
+  bufferTimeoutMs: 2000, // Timeout for stale buffers
+  debug: true,         // Enable logging
+});
+```
+
+**Tuning Guidelines:**
+
+| Parameter | Lower Value | Higher Value |
+|-----------|-------------|--------------|
+| `rmsThreshold` | More sensitive (catches quiet speech) | Less sensitive (filters more noise) |
+| `minVoicedFrames` | Faster triggering | More confirmation required |
+| `minFrames` | Less buffered context | More buffered context preserved |
+| `maxBufferFrames` | Less memory, faster discard | More tolerance for delayed speech |
+
+**Recommended starting values:**
+- Quiet environment: `rmsThreshold: 0.01`
+- Noisy environment: `rmsThreshold: 0.03`
+- Quick speakers: `minVoicedFrames: 1`
+- Deliberate speakers: `minVoicedFrames: 3`
+
+---
+
 ## Technical Architecture
 
 ### Audio Frame Processing
 - **Frame Size**: 320 bytes (20ms @ 16kHz mono PCM16)
-- **Buffering**: Ring buffer maintains 120ms preroll for utterance context
-- **Voice Detection**: WebRTC VAD with configurable aggressiveness (0-3)
+- **Client-Side Gate**: AudioGate buffers up to 50 frames (1 second) while detecting voice
+- **Server-Side Buffer**: Ring buffer maintains 120ms preroll for utterance context
+- **Voice Detection**: 
+  - Client: RMS energy threshold (fast, prevents spurious sessions)
+  - Server: WebRTC VAD with configurable aggressiveness (0-3)
 - **Endpointing**: Minimum 120ms speech, 250ms silence for utterance boundaries
 
 ### STT Engine Configuration
@@ -340,24 +476,31 @@ STT Server Events
 ### Typical Conversation Flow
 ```
 1. User starts speaking in Discord voice channel
-   → Discord client detects voice activity
-   → Audio pipeline: Opus → PCM → Frames → WebSocket
+   → Discord client receives audio via Opus stream
+   → Audio pipeline: Opus → PCM → FrameChunker → AudioGate
 
-2. STT server receives first frames
-   → VAD detects speech start
+2. AudioGate detects voice activity
+   → Buffers initial frames while checking RMS energy
+   → Voice confirmed: emits 'open' event
+   → WebSocket session created
+   → Buffered frames flushed to server
+
+3. STT server receives frames
+   → VAD confirms speech (server-side)
    → Ring buffer provides preroll context
    → Whisper processing begins
 
-3. Streaming partial results (every ~300ms)
+4. Streaming partial results (every ~300ms)
    → partial events with incremental revisions
    → Discord message live-editing
    → Confidence and timing metadata
 
-4. User stops speaking
+5. User stops speaking
    → Silence detection triggers endpoint
    → Final Whisper processing
    → final event replaces partial message
    → Optional clean final posted to separate channel
+   → AudioGate closes, session ends
 ```
 
 ### Multi-Speaker Handling

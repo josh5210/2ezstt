@@ -40,6 +40,57 @@ python -m pytest tests/ -v
 npm test
 ```
 
+## Debugging
+
+### Enable Debug Logging
+
+For development and troubleshooting, enable verbose logging:
+
+```bash
+# Client-side: AudioGate voice detection debugging
+export AUDIO_GATE_DEBUG=1
+
+# Server-side: Full debug logging
+export EZSTT_LOG_LEVEL=DEBUG
+```
+
+### Key Debug Points
+
+**AudioGate (`client/audio/audio_gate.ts`)**
+- Logs every frame with RMS energy calculation
+- Logs gate open/close events with reason
+- Shows buffer state and voiced frame counts
+
+**Server Session (`sidecar/server.py`)**
+- Session lifecycle state transitions
+- Message counts (binary vs JSON)
+- Frame timing (first/last frame timestamps)
+- Warnings for sessions ending with 0 frames
+
+**Endpoint/VAD (`sidecar/endpoint.py`)**
+- VAD state transitions (IDLE ↔ IN_SPEECH)
+- Frame statistics at key intervals
+- Voiced/unvoiced frame ratios
+
+**Whisper Backend (`sidecar/whisper_backend.py`)**
+- Model load timing and device selection
+- Transcription events with duration and confidence
+- Device fallback attempts
+
+### Debug Output Interpretation
+
+```
+# Good: Voice detected, session created with frames
+[AudioGate] OPEN reason=voice_detected buffered=4 voiced=2
+[Session x] RX binary: 640 bytes (total: 50 binary, 0 json)
+
+# Bad: Session created but no audio received
+[Session x] WARNING: session ending with 0 frames received
+
+# Bad: Too many discards (threshold may be too high)
+[AudioGate] RESET reason=timeout discarding=50 frames
+```
+
 ## Pull Request Process
 
 1. Ensure tests pass
