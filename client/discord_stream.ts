@@ -471,12 +471,14 @@ function makePipeline(vc: VoiceConnection, userId: string, onEvent: (ev: OutEven
   const gate = new AudioGate({
     minFrames: 3,        // 60ms minimum
     minVoicedFrames: 2,  // At least 2 frames with voice
-    rmsThreshold: 0.02,  // RMS threshold for voice detection
+    rmsThreshold: 0.015, // RMS threshold for voice detection (lowered for quieter speech)
     debug: process.env.AUDIO_GATE_DEBUG === '1',
   });
 
   let session: WSSession | null = null;
   let sessionConnecting = false;
+  let sessionReady = false;
+  let pendingFrames: Buffer[] = [];  // Buffer frames while session connects
 
   gate.on('open', () => {
     // Voice detected - create and connect session
@@ -489,18 +491,33 @@ function makePipeline(vc: VoiceConnection, userId: string, onEvent: (ev: OutEven
       .then(() => {
         session = newSession;
         sessionConnecting = false;
-        console.log(`[AudioGate] Session created for user=${userId}`);
+        sessionReady = true;
+        
+        // Flush all frames that arrived while session was connecting
+        const framesToFlush = pendingFrames;
+        pendingFrames = [];
+        for (const frame of framesToFlush) {
+          session.writeFrame(frame);
+        }
+        
+        if (process.env.AUDIO_GATE_DEBUG === '1') {
+          console.log(`[AudioGate] Session ready for user=${userId}, flushed ${framesToFlush.length} pending frames`);
+        }
       })
       .catch((err) => {
         console.error('[AudioGate] ws connect error', err);
         sessionConnecting = false;
+        pendingFrames = []; // Discard on error
       });
   });
 
   gate.on('frame', (frame: Buffer) => {
-    // Forward frames to session (session may still be connecting for first few frames)
-    if (session) {
+    if (sessionReady && session) {
+      // Session is connected, send immediately
       session.writeFrame(frame);
+    } else {
+      // Session still connecting, buffer the frame
+      pendingFrames.push(frame);
     }
   });
 
@@ -509,10 +526,12 @@ function makePipeline(vc: VoiceConnection, userId: string, onEvent: (ev: OutEven
     if (session) {
       session.end();
     }
+    pendingFrames = [];
   });
 
   gate.on('discard', ({ frames, reason }: { frames: number; reason: string }) => {
     console.log(`[AudioGate] Discarded ${frames} frames (${reason}) for user=${userId} - no session created`);
+    pendingFrames = [];
   });
 
   // Route chunker output through the gate
