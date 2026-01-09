@@ -10,12 +10,15 @@ behaviour designed for streaming use.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - exercised implicitly when dependency exists
     import webrtcvad  # type: ignore
@@ -86,9 +89,17 @@ class _FrameRingBuffer:
 
 
 class Endpoint:
-    def __init__(self, cfg: EndpointConfig, debug: bool = False, vad: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        cfg: EndpointConfig,
+        debug: bool = False,
+        vad: Optional[Any] = None,
+        debug_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self.cfg = cfg
         self._debug = debug
+        self._debug_callback = debug_callback
+        self._log = logger.getChild("endpoint")
         if cfg.frame_ms not in {10, 20, 30}:
             raise ValueError("frame_ms must be one of {10, 20, 30} for WebRTC VAD")
         samples_per_frame = cfg.sample_rate * cfg.frame_ms
@@ -106,12 +117,20 @@ class Endpoint:
         self._voiced_accum_ms = 0
         self._utter_start_clock_ms = 0
         self._active_frames: List[np.ndarray] = []
+        # Debug counters
+        self._total_frames = 0
+        self._voiced_frames = 0
+        self._state_transitions = 0
         if vad is not None:
             self._vad = vad
         else:
             if webrtcvad is None:
                 raise ImportError("webrtcvad is required unless a custom VAD instance is supplied")
             self._vad = webrtcvad.Vad(cfg.vad_aggressiveness)
+        self._log.debug(
+            "Endpoint initialized: sr=%d frame_ms=%d min_speech_ms=%d end_silence_ms=%d vad_agg=%d",
+            cfg.sample_rate, cfg.frame_ms, cfg.min_speech_ms, cfg.end_silence_ms, cfg.vad_aggressiveness
+        )
 
     def reset(self) -> None:
         self._state = _State.IDLE
@@ -129,21 +148,51 @@ class Endpoint:
         vad_flag = bool(self._vad.is_speech(frame_bytes, self.cfg.sample_rate))
         self._ring_buffer.push(frame)
         frame_end_ms = self._clock_ms + self.cfg.frame_ms
+        self._total_frames += 1
+        if vad_flag:
+            self._voiced_frames += 1
+        
         utterance: Optional[Utterance] = None
+        prev_state = self._state
         if self._state is _State.IDLE:
             utterance = self._process_idle_frame(frame, vad_flag, frame_end_ms)
         else:
             utterance = self._process_in_speech_frame(frame, vad_flag, frame_end_ms)
+        
+        # Track state transitions
+        if self._state != prev_state:
+            self._state_transitions += 1
+            self._log.debug(
+                "VAD state: %s -> %s at clock=%dms (frame=%d voiced_frames=%d transitions=%d)",
+                prev_state.value, self._state.value, frame_end_ms,
+                self._total_frames, self._voiced_frames, self._state_transitions
+            )
+        
         self._clock_ms = frame_end_ms
         if self._debug:
             self._debug_log(
                 f"clock={self._clock_ms}, state={self._state.value}, vad={int(vad_flag)}, "
                 f"voiced_run_ms={self._voiced_run_ms}, silence_run_ms={self._silence_run_ms}"
             )
+        
+        # Periodic debug logging
+        if self._total_frames in {1, 10, 50} or self._total_frames % 100 == 0:
+            self._log.debug(
+                "endpoint stats: frames=%d voiced=%d (%.1f%%) state=%s voiced_run=%dms silence_run=%dms",
+                self._total_frames, self._voiced_frames,
+                (self._voiced_frames / self._total_frames * 100) if self._total_frames > 0 else 0,
+                self._state.value, self._voiced_run_ms, self._silence_run_ms
+            )
+        
         return utterance
 
     def flush(self) -> Optional[Utterance]:
+        self._log.debug(
+            "flush called: state=%s active_frames=%d clock=%dms",
+            self._state.value, len(self._active_frames), self._clock_ms
+        )
         if self._state is _State.IDLE:
+            self._log.debug("flush: no active utterance (IDLE state)")
             return None
         audio_frames = list(self._active_frames)
         audio = self._concat_frames(audio_frames)
@@ -155,11 +204,32 @@ class Endpoint:
             silence_tail_ms=self._silence_run_ms,
             frames=len(audio_frames),
         )
+        dur_ms = utterance.t1_ms - utterance.t0_ms
+        self._log.debug(
+            "UTTERANCE FLUSH: t0=%d t1=%d dur=%dms voiced=%dms frames=%d audio_samples=%d",
+            utterance.t0_ms, utterance.t1_ms, dur_ms, utterance.voiced_ms,
+            utterance.frames, len(audio)
+        )
         if self._debug:
-            dur_ms = utterance.t1_ms - utterance.t0_ms
             self._debug_log(f"FINAL t1_ms={utterance.t1_ms} dur_ms={dur_ms} (flush)")
         self._reset_after_utterance()
         return utterance
+
+    def debug_stats(self) -> dict:
+        """Return current debug statistics for the endpoint."""
+        return {
+            "state": self._state.value,
+            "clock_ms": self._clock_ms,
+            "total_frames": self._total_frames,
+            "voiced_frames": self._voiced_frames,
+            "voiced_ratio": (self._voiced_frames / self._total_frames) if self._total_frames > 0 else 0,
+            "state_transitions": self._state_transitions,
+            "voiced_run_ms": self._voiced_run_ms,
+            "silence_run_ms": self._silence_run_ms,
+            "voiced_accum_ms": self._voiced_accum_ms,
+            "active_frames": len(self._active_frames),
+            "utter_start_ms": self._utter_start_clock_ms if self._state == _State.IN_SPEECH else None,
+        }
 
     def _process_idle_frame(self, frame: np.ndarray, vad_flag: bool, frame_end_ms: int) -> Optional[Utterance]:
         if vad_flag:
@@ -200,6 +270,11 @@ class Endpoint:
         self._silence_run_ms = 0
         self._voiced_accum_ms = self._voiced_run_ms
         self._state = _State.IN_SPEECH
+        self._log.debug(
+            "UTTERANCE START: t0_ms=%d frame_end=%d voiced_run=%dms preroll=%dms active_frames=%d",
+            self._utter_start_clock_ms, frame_end_ms, self._voiced_run_ms,
+            preroll_used_ms, len(self._active_frames)
+        )
         if self._debug:
             self._debug_log(f"START t0_ms={self._utter_start_clock_ms}")
 
@@ -219,8 +294,13 @@ class Endpoint:
             silence_tail_ms=self._silence_run_ms,
             frames=len(audio_frames),
         )
+        dur_ms = utterance.t1_ms - utterance.t0_ms
+        self._log.debug(
+            "UTTERANCE FINALIZE: t0=%d t1=%d dur=%dms voiced=%dms silence_tail=%dms frames=%d audio_samples=%d",
+            utterance.t0_ms, utterance.t1_ms, dur_ms, utterance.voiced_ms,
+            utterance.silence_tail_ms, utterance.frames, len(audio)
+        )
         if self._debug:
-            dur_ms = utterance.t1_ms - utterance.t0_ms
             self._debug_log(f"FINAL t1_ms={utterance.t1_ms} dur_ms={dur_ms}")
         self._reset_after_utterance()
         return utterance

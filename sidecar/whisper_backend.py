@@ -1,6 +1,7 @@
 """Thin wrapper around faster-whisper for single-utterance decoding."""
 from __future__ import annotations
 
+import logging
 import math
 import os
 import time
@@ -11,6 +12,8 @@ from typing import Callable, List, NamedTuple, Optional
 
 import numpy as np
 from faster_whisper import WhisperModel
+
+logger = logging.getLogger(__name__)
 
 MODEL_NAME = os.getenv("EZSTT_MODEL", "medium")
 DEVICE = os.getenv("EZSTT_DEVICE", "auto")
@@ -113,13 +116,23 @@ class WhisperBackend:
         context_left = self._validate_context(context_left_pcm16, "context_left_pcm16")
         context_right = self._validate_context(context_right_pcm16, "context_right_pcm16")
 
+        audio_duration_ms = int(len(audio) / sr * 1000)
+        logger.debug(
+            "transcribe: audio_samples=%d duration_ms=%d time_offset=%d context_left=%s context_right=%s",
+            len(audio), audio_duration_ms, time_offset_ms,
+            len(context_left) if context_left is not None else None,
+            len(context_right) if context_right is not None else None,
+        )
+
         max_samples = int(sr * (self.max_utter_ms / 1000.0))
         if len(audio) > max_samples:
+            logger.warning("audio exceeds max duration: %d > %d samples", len(audio), max_samples)
             raise ValueError("Utterance exceeds maximum duration")
 
         padded_audio, used_padding_ms, left_shift_ms = self._apply_padding(
             audio, sr, context_left, context_right
         )
+        logger.debug("padding applied: used_padding_ms=%d left_shift_ms=%d", used_padding_ms, left_shift_ms)
 
         float_audio = padded_audio.astype(np.float32) / 32768.0
         np.clip(float_audio, -1.0, 1.0, out=float_audio)
@@ -127,6 +140,10 @@ class WhisperBackend:
         model = self._ensure_model_loaded()
         language = lang or self.default_lang
 
+        logger.debug(
+            "starting transcription: lang=%s beam_size=%d best_of=%d device=%s",
+            language, self.beam_size, self.best_of, self._resolved_device
+        )
         start_time = time.perf_counter()
         segments_iter, info = model.transcribe(
             float_audio,
@@ -137,8 +154,10 @@ class WhisperBackend:
             condition_on_previous_text=False,
         )
         elapsed_ms = int(round((time.perf_counter() - start_time) * 1000))
+        logger.debug("transcription complete: elapsed_ms=%d", elapsed_ms)
 
         raw_segments = list(segments_iter)
+        logger.debug("transcription returned %d raw segments", len(raw_segments))
 
         segments: List[WhisperSegment] = []
         logprobs: List[float] = []
@@ -191,6 +210,11 @@ class WhisperBackend:
                 confidence *= penalty
         confidence = max(0.0, min(1.0, confidence))
 
+        logger.debug(
+            "transcribe result: text_len=%d confidence=%.3f tokens=%d time_ms=%d device=%s",
+            len(text), confidence, total_tokens, elapsed_ms, self._resolved_device
+        )
+
         return WhisperResult(
             text=text,
             confidence=confidence,
@@ -205,14 +229,24 @@ class WhisperBackend:
     def _ensure_model_loaded(self) -> WhisperModel:
         if self._model is not None:
             return self._model
+        logger.debug("model not loaded, acquiring lock...")
         with self._model_lock:
             if self._model is not None:
+                logger.debug("model loaded by another thread while waiting")
                 return self._model
 
+            logger.info("loading Whisper model: dir=%s device=%s compute=%s",
+                       self.model_cache_dir, self.device, self.compute_type)
+            start_time = time.perf_counter()
             model, device_option, compute_type = self._acquire_shared_model()
+            load_time_ms = int((time.perf_counter() - start_time) * 1000)
             self._model = model
             self._resolved_device = device_option
             self._resolved_compute_type = compute_type
+            logger.info(
+                "Whisper model loaded: device=%s compute_type=%s load_time_ms=%d",
+                device_option, compute_type, load_time_ms
+            )
 
         return self._model
 
@@ -381,10 +415,12 @@ def _get_or_create_shared_model(
     cpu_threads: int,
 ) -> tuple[WhisperModel, str, str]:
     normalized_dir = _normalize_model_dir(model_dir)
+    logger.debug("_get_or_create_shared_model: dir=%s attempts=%s", normalized_dir, device_attempts)
 
     with _SHARED_MODEL_LOCK:
         global _SHARED_MODEL, _SHARED_MODEL_CONFIG
         if _SHARED_MODEL is not None and _SHARED_MODEL_CONFIG is not None:
+            logger.debug("using existing shared model: device=%s", _SHARED_MODEL_CONFIG.device)
             _ensure_shared_config_compatible(
                 normalized_dir, device_attempts, resolve_compute_type, cpu_threads, _SHARED_MODEL_CONFIG
             )
@@ -393,9 +429,12 @@ def _get_or_create_shared_model(
         last_error: Optional[Exception] = None
         for device_option in device_attempts:
             compute_type = resolve_compute_type(device_option)
+            logger.info("attempting to load model: device=%s compute_type=%s", device_option, compute_type)
             try:
                 model = create_model(device_option, compute_type)
+                logger.info("model loaded successfully: device=%s compute_type=%s", device_option, compute_type)
             except Exception as exc:  # pragma: no cover - depends on local runtime
+                logger.warning("failed to load model with device=%s: %s", device_option, exc)
                 last_error = exc
                 continue
 
@@ -409,6 +448,7 @@ def _get_or_create_shared_model(
             return model, device_option, compute_type
 
     error_message = "Failed to load WhisperModel from local directory"
+    logger.error("%s: %s", error_message, last_error)
     if last_error is not None:
         raise RuntimeError(error_message) from last_error
     raise RuntimeError(error_message)

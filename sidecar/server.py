@@ -323,6 +323,14 @@ class Session:
     last_activity_ns: int = field(init=False)
     total_frames_received: int = 0
     outbox_overflow_events: int = field(init=False, default=0)
+    # Debug state tracking
+    _lifecycle_state: str = field(init=False, default="created")
+    _messages_received: int = field(init=False, default=0)
+    _messages_sent: int = field(init=False, default=0)
+    _binary_messages: int = field(init=False, default=0)
+    _json_messages: int = field(init=False, default=0)
+    _first_frame_ns: Optional[int] = field(init=False, default=None)
+    _last_frame_ns: Optional[int] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.log = logger.getChild(f"session[{self.session_id}]")
@@ -332,8 +340,17 @@ class Session:
         self.frame_bytes = self.frame_samples * 2
         self._last_queue_warning_frames = 0
         self.outbox_overflow_events = 0
+        # Initialize debug tracking
+        self._lifecycle_state = "initializing"
+        self._messages_received = 0
+        self._messages_sent = 0
+        self._binary_messages = 0
+        self._json_messages = 0
+        self._first_frame_ns = None
+        self._last_frame_ns = None
         self._init_components()
         kws_status = "enabled" if self.keyword_spotter is not None else "disabled"
+        self._set_lifecycle_state("created")
         self.log.info(
             "session created peer=%s speaker=%s transport=%s sr=%d frame_ms=%d kws=%s json_audio=%s",
             self.peer,
@@ -344,6 +361,40 @@ class Session:
             kws_status,
             self.config.accept_json_audio,
         )
+
+    def _set_lifecycle_state(self, new_state: str) -> None:
+        """Track session lifecycle state transitions for debugging."""
+        old_state = self._lifecycle_state
+        self._lifecycle_state = new_state
+        elapsed_ms = (self.now_ns() - self.start_ns) // 1_000_000
+        self.log.debug(
+            "lifecycle: %s -> %s elapsed_ms=%d frames=%d msgs_in=%d msgs_out=%d",
+            old_state, new_state, elapsed_ms, self.total_frames_received,
+            self._messages_received, self._messages_sent,
+        )
+
+    def debug_stats(self) -> Dict[str, Any]:
+        """Return current debug statistics for the session."""
+        elapsed_ms = (self.now_ns() - self.start_ns) // 1_000_000
+        frame_duration_ms = 0
+        if self._first_frame_ns and self._last_frame_ns:
+            frame_duration_ms = (self._last_frame_ns - self._first_frame_ns) // 1_000_000
+        return {
+            "session_id": self.session_id,
+            "peer": self.peer,
+            "lifecycle_state": self._lifecycle_state,
+            "elapsed_ms": elapsed_ms,
+            "total_frames": self.total_frames_received,
+            "dropped_frames": self.dropped_frames,
+            "queue_depth": len(self.recv_queue),
+            "messages_received": self._messages_received,
+            "messages_sent": self._messages_sent,
+            "binary_messages": self._binary_messages,
+            "json_messages": self._json_messages,
+            "frame_duration_ms": frame_duration_ms,
+            "outbox_pending": len(self.outbox),
+            "endpoint_in_speech": self.endpoint.is_in_speech if hasattr(self, 'endpoint') else None,
+        }
 
     def _init_components(self) -> None:
         endpoint_factory_raw = getattr(self.app.state, "endpoint_factory", None)
@@ -468,8 +519,10 @@ class Session:
 
     async def send_json(self, payload: Dict[str, Any]) -> bool:
         if self.closed:
+            self.log.debug("send_json skipped (session closed) type=%s", payload.get("type"))
             return False
         text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        msg_type = payload.get("type", "unknown")
         should_close = False
         error: Optional[BaseException] = None
         async with self.send_lock:
@@ -477,6 +530,8 @@ class Session:
                 return False
             try:
                 await self.websocket.send_text(text)
+                self._messages_sent += 1
+                self.log.debug("send_json ok type=%s size=%d total_sent=%d", msg_type, len(text), self._messages_sent)
             except (WebSocketDisconnect, RuntimeError) as exc:
                 should_close = True
                 error = exc
@@ -485,7 +540,7 @@ class Session:
                 error = exc
         if should_close:
             if error is not None:
-                self.log.debug("send_json failed; marking session closed: %s", error)
+                self.log.debug("send_json failed type=%s error=%s; marking session closed", msg_type, error)
             await self._handle_send_failure(reason="send_failed")
             return False
         return True
@@ -516,17 +571,25 @@ class Session:
 
     async def close(self, *, code: int = 1000, reason: str = "unspecified") -> None:
         if self.closed:
+            self.log.debug("close() called but already closed reason=%s", reason)
             return
+        self._set_lifecycle_state(f"closing:{reason}")
+        elapsed_ms = (self.now_ns() - self.start_ns) // 1_000_000
+        stats = self.debug_stats()
         self.log.info(
-            "closing session reason=%s code=%d peer=%s dropped_frames=%d total_frames=%d outbox_pending=%d",
-            reason,
-            code,
-            self.peer,
-            self.dropped_frames,
-            self.total_frames_received,
-            len(self.outbox),
+            "closing session reason=%s code=%d peer=%s dropped_frames=%d total_frames=%d outbox_pending=%d "
+            "elapsed_ms=%d msgs_in=%d msgs_out=%d binary=%d json=%d",
+            reason, code, self.peer, self.dropped_frames, self.total_frames_received, len(self.outbox),
+            elapsed_ms, self._messages_received, self._messages_sent, self._binary_messages, self._json_messages,
         )
+        # Log warning if session ended with no frames (potential issue)
+        if self.total_frames_received == 0 and elapsed_ms > 100:
+            self.log.warning(
+                "session ended with ZERO frames after %dms - possible client/transport issue peer=%s",
+                elapsed_ms, self.peer
+            )
         self.closed = True
+        self._set_lifecycle_state("closed")
         if self.heartbeat_task:
             if not self.heartbeat_task.done():
                 self.heartbeat_task.cancel()
@@ -599,6 +662,13 @@ def _authorization_ok(header: Optional[str], token: str) -> bool:
 def _enqueue_frame(session: Session, frame: np.ndarray) -> None:
     limit = max(0, session.config.recv_queue_frames)
     queue = session.recv_queue
+    # Track first/last frame timing for debugging
+    now_ns = session.now_ns()
+    if session._first_frame_ns is None:
+        session._first_frame_ns = now_ns
+        session.log.debug("first audio frame received peer=%s", session.peer)
+    session._last_frame_ns = now_ns
+    
     if limit and len(queue) >= limit:
         session.dropped_frames += 1
         queue_len = len(queue)
@@ -624,6 +694,13 @@ def _enqueue_frame(session: Session, frame: np.ndarray) -> None:
     else:
         queue.append(frame)
     session.total_frames_received += 1
+    # Periodic debug logging for frame reception
+    if session.total_frames_received in {1, 10, 50} or session.total_frames_received % 100 == 0:
+        session.log.debug(
+            "frame stats: total=%d queue=%d dropped=%d in_speech=%s",
+            session.total_frames_received, len(queue), session.dropped_frames,
+            session.endpoint.is_in_speech if hasattr(session, 'endpoint') else "N/A"
+        )
 
 
 async def _process_frames(session: Session) -> None:
@@ -762,15 +839,28 @@ async def _build_final_event(session: Session, utterance: Utterance, utterance_i
 
 
 async def _handle_binary_message(session: Session, data: bytes) -> None:
+    session._binary_messages += 1
+    session._messages_received += 1
     if not data:
+        session.log.debug("received empty binary message")
         return
     if len(data) > session.config.max_msg_bytes:
+        session.log.warning("binary message too large: %d > %d", len(data), session.config.max_msg_bytes)
         await session.send_error("message_too_large", "Binary payload exceeds limit")
         return
     if len(data) % session.frame_bytes != 0:
+        session.log.warning(
+            "bad frame size: %d bytes not divisible by frame_bytes=%d",
+            len(data), session.frame_bytes
+        )
         await session.send_error("bad_frame_size", "Audio chunk must be a multiple of a frame")
         return
     frame_bytes = session.frame_bytes
+    num_frames = len(data) // frame_bytes
+    session.log.debug(
+        "binary message: %d bytes = %d frames, total_binary_msgs=%d",
+        len(data), num_frames, session._binary_messages
+    )
     for offset in range(0, len(data), frame_bytes):
         frame = np.frombuffer(data[offset : offset + frame_bytes], dtype=np.int16)
         frame = np.array(frame, copy=True)
@@ -779,25 +869,37 @@ async def _handle_binary_message(session: Session, data: bytes) -> None:
 
 
 async def _handle_json_message(session: Session, payload: Dict[str, Any]) -> bool:
+    session._json_messages += 1
+    session._messages_received += 1
     msg_type = payload.get("type")
+    session.log.debug(
+        "json message type=%s total_json_msgs=%d total_msgs=%d",
+        msg_type, session._json_messages, session._messages_received
+    )
     if msg_type == "audio.chunk":
         if not session.config.accept_json_audio:
+            session.log.debug("rejecting audio.chunk - json_audio disabled")
             await session.send_error("json_audio_disabled", "JSON audio transport disabled")
             return True
         pcm_b64 = payload.get("pcm_base64")
         if not isinstance(pcm_b64, str):
+            session.log.warning("audio.chunk missing pcm_base64 field")
             await session.send_error("invalid_chunk", "pcm_base64 missing")
             return True
         try:
             audio_bytes = base64.b64decode(pcm_b64, validate=True)
-        except Exception:
+        except Exception as exc:
+            session.log.warning("audio.chunk invalid base64: %s", exc)
             await session.send_error("invalid_chunk", "pcm_base64 invalid")
             return True
+        session.log.debug("audio.chunk decoded: %d bytes", len(audio_bytes))
         await _handle_binary_message(session, audio_bytes)
         return True
     if msg_type == "session.end":
+        session.log.debug("session.end received, frames_so_far=%d", session.total_frames_received)
         await _finalize_session_end(session)
         return True
+    session.log.warning("unknown json message type: %r", msg_type)
     await session.send_error("unknown_type", f"unknown message type {msg_type!r}")
     return True
 
@@ -937,9 +1039,11 @@ async def websocket_handler(websocket: WebSocket, authorization: Optional[str] =
         app=app,
     )
     session.touch_activity()
+    session._set_lifecycle_state("handshake_complete")
     session.heartbeat_task = asyncio.create_task(_heartbeat_loop(session))
     session.heartbeat_task.add_done_callback(_session_task_done_callback(session, "heartbeat"))
     session.log.info("session handshake completed peer=%s transport=%s", peer, transport)
+    session._set_lifecycle_state("active")
     if not await session.send_json(
         {
             "type": "session.started",
@@ -948,39 +1052,58 @@ async def websocket_handler(websocket: WebSocket, authorization: Optional[str] =
             "timestamp_ms": session.now_ms(),
         }
     ):
+        session.log.warning("failed to send session.started - aborting")
         return
 
     try:
+        session.log.debug("entering main message loop")
+        loop_iterations = 0
         while True:
+            loop_iterations += 1
             message = await _receive_with_timeout(session)
             if message is None:
-                session.log.debug("receive timeout delivered None; closing loop")
+                session.log.debug("receive timeout delivered None; closing loop after %d iterations", loop_iterations)
                 break
-            if message["type"] == "websocket.disconnect":
+            msg_ws_type = message.get("type", "unknown")
+            if msg_ws_type == "websocket.disconnect":
                 session.log.info("websocket disconnect event received from peer")
+                session._set_lifecycle_state("peer_disconnect")
                 break
             if message.get("text") is not None:
                 session.touch_activity()
+                raw_text = message["text"]
+                session.log.debug("received text message len=%d", len(raw_text) if raw_text else 0)
                 try:
-                    payload = json.loads(message["text"])
-                except json.JSONDecodeError:
+                    payload = json.loads(raw_text)
+                except json.JSONDecodeError as exc:
+                    session.log.warning("JSON decode error: %s (text[:100]=%r)", exc, raw_text[:100] if raw_text else "")
                     await session.send_error("invalid_json", "Failed to decode JSON message")
                     continue
                 keep_running = await _handle_json_message(session, payload)
                 if not keep_running:
+                    session.log.debug("json handler returned False; exiting loop")
                     break
             elif message.get("bytes") is not None:
                 session.touch_activity()
-                await _handle_binary_message(session, message["bytes"])
+                data = message["bytes"]
+                session.log.debug("received binary message len=%d", len(data) if data else 0)
+                await _handle_binary_message(session, data)
             else:
+                session.log.debug("received message with no text/bytes: type=%s", msg_ws_type)
                 continue
-    except WebSocketDisconnect:
-        session.log.info("websocket disconnect from peer")
+    except WebSocketDisconnect as exc:
+        session.log.info("websocket disconnect from peer: %s", exc)
+        session._set_lifecycle_state("ws_disconnect")
     except Exception:  # pragma: no cover - defensive
         session.log.exception("Unhandled websocket error")
+        session._set_lifecycle_state("error")
         if not session.closed:
             await session.send_error("internal_error", "Unhandled server error")
     finally:
+        session.log.debug(
+            "exiting websocket handler: frames=%d msgs_in=%d msgs_out=%d",
+            session.total_frames_received, session._messages_received, session._messages_sent
+        )
         if not session.closed:
             await _finalize_disconnect(session)
 
