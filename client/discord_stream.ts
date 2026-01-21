@@ -431,13 +431,21 @@ function buildFinalContent(key: string, state: PartialMessageState | undefined, 
 function ensureJoined(): VoiceConnection {
   const existing = getVoiceConnection(GUILD_ID);
   if (existing) return existing;
-  return joinVoiceChannel({
+  const connection = joinVoiceChannel({
     channelId: VOICE_CHANNEL_ID,
     guildId: GUILD_ID,
     adapterCreator: client.guilds.cache.get(GUILD_ID)!.voiceAdapterCreator,
     selfDeaf: false,
-    decryptionFailureTolerance: 50, // Tolerate some DAVE decryption failures without disconnecting
+    decryptionFailureTolerance: 50, // Allow consecutive decryption failures before session reset
+    debug: process.env.VOICE_DEBUG === '1',
   });
+
+  // Handle voice connection errors (including DAVE decryption issues)
+  connection.on('error', (error) => {
+    console.error('[VoiceConnection] Error:', error.message);
+  });
+
+  return connection;
 }
 
 function makePipeline(vc: VoiceConnection, userId: string, onEvent: (ev: OutEvent) => void) {
@@ -730,20 +738,22 @@ async function notifyDecryptionFailure(error: Error) {
   }
 }
 
-// Handle DAVE decryption failures gracefully
+// Handle DAVE decryption failures gracefully - ONLY catch the specific DAVE error
+const DAVE_ERROR_PATTERN = /Failed to decrypt.*DecryptionFailed/;
+
 process.on('uncaughtException', (error) => {
-  if (error.message?.includes('DecryptionFailed') || error.message?.includes('decrypt')) {
+  if (error.message && DAVE_ERROR_PATTERN.test(error.message)) {
     void notifyDecryptionFailure(error);
-    return; // Don't crash - these are non-fatal
+    return; // Don't crash - these are non-fatal DAVE protocol errors
   }
-  // For other errors, log and exit
+  // For all other errors, log and exit
   console.error('Uncaught exception:', error);
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason) => {
   const error = reason instanceof Error ? reason : new Error(String(reason));
-  if (error.message?.includes('DecryptionFailed') || error.message?.includes('decrypt')) {
+  if (error.message && DAVE_ERROR_PATTERN.test(error.message)) {
     void notifyDecryptionFailure(error);
     return; // Don't crash
   }
