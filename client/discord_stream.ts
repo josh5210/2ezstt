@@ -436,6 +436,7 @@ function ensureJoined(): VoiceConnection {
     guildId: GUILD_ID,
     adapterCreator: client.guilds.cache.get(GUILD_ID)!.voiceAdapterCreator,
     selfDeaf: false,
+    decryptionFailureTolerance: 50, // Tolerate some DAVE decryption failures without disconnecting
   });
 }
 
@@ -692,6 +693,61 @@ process.on('SIGTERM', () => {
   ttsServer.close();
   client.destroy();
   process.exit(0);
+});
+
+// Track decryption failures for rate-limited notifications
+let lastDecryptionNotification = 0;
+const DECRYPTION_NOTIFICATION_COOLDOWN_MS = 60_000; // 1 minute cooldown
+
+async function notifyDecryptionFailure(error: Error) {
+  const now = Date.now();
+  if (now - lastDecryptionNotification < DECRYPTION_NOTIFICATION_COOLDOWN_MS) {
+    console.warn('[DAVE] Decryption failure (notification throttled):', error.message);
+    return;
+  }
+  lastDecryptionNotification = now;
+
+  console.warn('[DAVE] Decryption failure:', error.message);
+
+  if (!client.isReady()) {
+    console.warn('[DAVE] Cannot send notification - client not ready');
+    return;
+  }
+
+  try {
+    const channel = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID);
+    if (channel?.isTextBased()) {
+      const textChannel = channel as TextChannel;
+      const timestamp = new Date().toISOString();
+      await textChannel.send(
+        `[DAVE Warning] Decryption failure at ${timestamp}\n` +
+        `\`\`\`\n${error.message}\n\`\`\`\n` +
+        `This may occur when users with older Discord clients join. The bot will continue operating.`
+      );
+    }
+  } catch (notifyErr) {
+    console.error('[DAVE] Failed to send notification:', notifyErr);
+  }
+}
+
+// Handle DAVE decryption failures gracefully
+process.on('uncaughtException', (error) => {
+  if (error.message?.includes('DecryptionFailed') || error.message?.includes('decrypt')) {
+    void notifyDecryptionFailure(error);
+    return; // Don't crash - these are non-fatal
+  }
+  // For other errors, log and exit
+  console.error('Uncaught exception:', error);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const error = reason instanceof Error ? reason : new Error(String(reason));
+  if (error.message?.includes('DecryptionFailed') || error.message?.includes('decrypt')) {
+    void notifyDecryptionFailure(error);
+    return; // Don't crash
+  }
+  console.error('Unhandled rejection:', reason);
 });
 
 client.login(TOKEN);
